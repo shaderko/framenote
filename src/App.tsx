@@ -44,6 +44,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type HlsInstance from "hls.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatTime, formatTimecode, isChunkCovered, isChunkTranscriptCovered, nextSubtitleStart, parseTimeline, planAnalysisChunks, timestampToSeconds, type TimelineEntry } from "./lib/timeline";
 
@@ -77,6 +78,7 @@ interface MediaRegistration {
   mixBaseUrl: string;
   audioTracks: AudioTrackInfo[];
   frameRate?: number;
+  streamKind: "file" | "hls";
 }
 
 interface CollaborationSession {
@@ -374,6 +376,7 @@ function precisionSeekScale(lift: number): number {
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<HlsInstance | null>(null);
   const mixAudioRef = useRef<HTMLAudioElement>(null);
   const playerRef = useRef<HTMLDivElement>(null);
   const cancelRequestedRef = useRef(false);
@@ -738,6 +741,61 @@ function App() {
   }, [config.model, config.ollamaUrl, config.provider]);
 
   useEffect(() => {
+    hlsRef.current?.destroy();
+    hlsRef.current = null;
+    const video = videoRef.current;
+    if (!video || !videoUrl || mediaRegistration?.streamKind !== "hls") return;
+
+    // Safari/WebKit can play HLS natively. WebView2 and other Chromium-based
+    // webviews use MSE through hls.js, which fetches only the playhead segment
+    // and a small read-ahead window rather than the full source.
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = videoUrl;
+      video.load();
+      return () => {
+        video.removeAttribute("src");
+        video.load();
+      };
+    }
+    let disposed = false;
+    void import("hls.js").then(({ default: Hls }) => {
+      if (disposed) return;
+      if (!Hls.isSupported()) {
+        showNotice("This system webview cannot play the shared HLS stream.", "error");
+        return;
+      }
+      const hls = new Hls({
+        startFragPrefetch: true,
+        maxBufferLength: 20,
+        maxMaxBufferLength: 40,
+        backBufferLength: 30,
+        fragLoadingTimeOut: 45_000,
+        manifestLoadingTimeOut: 15_000,
+      });
+      hlsRef.current = hls;
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(videoUrl));
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          hls.startLoad(video.currentTime);
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+        } else {
+          showNotice("Shared playback could not recover this stream.", "error");
+        }
+      });
+    }).catch(() => {
+      if (!disposed) showNotice("Shared playback support could not be loaded.", "error");
+    });
+    return () => {
+      disposed = true;
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
+    };
+  }, [mediaRegistration?.streamKind, showNotice, videoUrl]);
+
+  useEffect(() => {
     localStorage.setItem("framenote:volume", String(volume));
     if (videoRef.current) videoRef.current.volume = volume;
     if (mixAudioRef.current) mixAudioRef.current.volume = volume;
@@ -931,7 +989,7 @@ function App() {
     setCollaborationPhase("hosting");
     localStorage.setItem("framenote:display-name", displayName.trim() || "Host");
     try {
-      showNotice("Preparing a cached, compatible stream for guests. Local playback can continue.");
+      showNotice("Opening an on-demand stream. Only sections guests watch will be encoded.");
       const video = videoRef.current;
       const initialPosition = Math.max(0, video?.currentTime ?? currentTimeRef.current);
       const initialPlaybackRate = playbackRate;
@@ -960,8 +1018,8 @@ function App() {
           },
         });
       }
-      // Stream preparation may take long enough for the local playhead to have
-      // moved. Refresh the backend snapshot before any guest can join so a
+      // Session setup and relay connection happen while local playback keeps
+      // moving. Refresh the backend snapshot before any guest can join so a
       // stale creation-time position never rewinds the session.
       const liveVideo = videoRef.current;
       await invoke("publish_collaboration_event", {
@@ -2357,7 +2415,7 @@ function App() {
               <video
                 key={videoUrl}
                 ref={videoRef}
-                src={videoUrl ?? undefined}
+                src={mediaRegistration?.streamKind === "hls" ? undefined : videoUrl ?? undefined}
                 preload="auto"
                 onClick={togglePlayback}
                 onLoadedMetadata={(event) => handleLoadedMetadata(event.currentTarget)}
@@ -3231,7 +3289,7 @@ function CollaborationDialog({
               <div><Users size={15} /><strong>{session.participantCount} watching</strong></div>
               <ul>{session.participants.map((name, index) => <li key={`${name}-${index}`}><i />{name}</li>)}</ul>
             </div>
-            <p className="session-footnote">Playback, seeking, marks, subtitles, and Markdown changes synchronize between FrameNote peers. The host keeps the original video and canonical sidecar untouched; guests receive a cached H.264/AAC stream optimized for compatible playback.</p>
+            <p className="session-footnote">Playback, seeking, marks, subtitles, and Markdown changes synchronize between FrameNote peers. The original and canonical sidecar stay untouched; guests receive short H.264/AAC segments generated only around the active playhead.</p>
             <button className="secondary full session-stop" onClick={onStop}>{session.mode === "host" ? "End session" : "Leave session"}</button>
           </div>
         ) : (

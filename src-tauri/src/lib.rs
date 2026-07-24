@@ -2326,9 +2326,9 @@ fn poll_collaboration_service(
         .timeout(Duration::from_secs(4))
         .build()
         .map_err(|error| format!("Could not prepare the peer connection: {error}"))?
-        .get(url)
+        .get(&url)
         .send()
-        .map_err(|_| "The sharing peer is unavailable on the local network.".to_string())?;
+        .map_err(|error| format!("Could not reach the sharing session ({url}): {error}"))?;
     if !response.status().is_success() {
         return Err("The sharing peer ended this session.".into());
     }
@@ -2383,22 +2383,23 @@ fn publish_collaboration_event_service(
         .map_err(|_| "The collaboration state is unavailable.".to_string())?
         .clone()
         .ok_or_else(|| "No shared session is active.".to_string())?;
+    let event_url = format!(
+        "{}/session/{}/event",
+        joined.host_base_url, joined.token
+    );
     let response = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|error| format!("Could not prepare the peer connection: {error}"))?
-        .post(format!(
-            "{}/session/{}/event",
-            joined.host_base_url, joined.token
-        ))
+        .post(&event_url)
         .json(&NetworkEventRequest {
             peer_id: joined.peer_id,
             kind,
             payload,
         })
         .send()
-        .map_err(|_| "The sharing peer is unavailable on the local network.".to_string())?;
+        .map_err(|error| format!("Could not reach the sharing session ({event_url}): {error}"))?;
     if response.status().is_success() {
         Ok(())
     } else {

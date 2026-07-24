@@ -1780,6 +1780,21 @@ async fn host_relay_session(
         .name("framenote-relay".into())
         .spawn(move || {
             let mut ws = ws; // move ws into the thread
+
+            // Build HTTP client once, outside the loop. If it fails we bail out
+            // immediately rather than panicking mid-session.
+            let http = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[relay] Failed to build HTTP client: {e}");
+                    let _ = ws.send(Message::Close(None));
+                    return;
+                }
+            };
+
             loop {
                 if disconnect_clone.load(Ordering::Relaxed) {
                     let _ = ws.send(Message::Close(None));
@@ -1788,14 +1803,20 @@ async fn host_relay_session(
 
                 let msg = match ws.read() {
                     Ok(msg) => msg,
-                    Err(_) => break,
+                    Err(e) => {
+                        eprintln!("[relay] WebSocket read error — exiting listener: {e}");
+                        break;
+                    }
                 };
 
                 match msg {
                     Message::Text(text) => {
                         let data: serde_json::Value = match serde_json::from_str(&text) {
                             Ok(d) => d,
-                            Err(_) => continue,
+                            Err(e) => {
+                                eprintln!("[relay] Invalid JSON from relay: {e}");
+                                continue;
+                            }
                         };
 
                         match data["type"].as_str() {
@@ -1809,12 +1830,7 @@ async fn host_relay_session(
 
                                 let local_url = format!("http://127.0.0.1:{port}{path}");
 
-                                let client = reqwest::blocking::Client::builder()
-                                    .timeout(Duration::from_secs(30))
-                                    .build()
-                                    .expect("reqwest client");
-
-                                let mut req = client.request(
+                                let mut req = http.request(
                                     method.parse().unwrap_or(reqwest::Method::GET),
                                     &local_url,
                                 );

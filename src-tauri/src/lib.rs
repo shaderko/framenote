@@ -1720,7 +1720,11 @@ async fn host_relay_session(
     let register_video = video_name.clone();
 
     let ws = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
-        let (mut ws, _) = tungstenite::connect(&ws_url)
+        // Allow large messages (video chunks up to 512 MiB, single frame up to 128 MiB)
+        let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
+        ws_config.max_message_size = Some(512 << 20); // 512 MiB
+        ws_config.max_frame_size = Some(128 << 20);   // 128 MiB
+        let (mut ws, _) = tungstenite::client::connect_with_config(&ws_url, Some(ws_config), 3)
             .map_err(|e| format!("Could not connect to relay ({ws_url}): {e}"))?;
 
         let register = serde_json::json!({

@@ -1855,20 +1855,49 @@ async fn host_relay_session(
                                             })
                                             .collect::<serde_json::Map<_, _>>();
                                         let resp_body = resp.bytes().unwrap_or_default();
-                                        let body_b64 = BASE64.encode(&resp_body);
 
-                                        let response_msg = serde_json::json!({
-                                            "type": "http-response",
-                                            "id": id,
-                                            "status": status,
-                                            "headers": resp_headers,
-                                            "body": body_b64,
-                                        });
-                                        if ws
-                                            .send(Message::Text(response_msg.to_string().into()))
-                                            .is_err()
-                                        {
-                                            break;
+                                        // For small bodies (< 256 KiB), send inline base64 to
+                                        // keep things simple. For large bodies (video data),
+                                        // send the body as a binary WebSocket frame to avoid
+                                        // base64 overhead and WebSocket message size limits.
+                                        if resp_body.len() > 256 * 1024 {
+                                            // Send JSON metadata first, then raw binary frame
+                                            let meta = serde_json::json!({
+                                                "type": "http-response",
+                                                "id": id,
+                                                "status": status,
+                                                "headers": resp_headers,
+                                                "bodyLength": resp_body.len(),
+                                            });
+                                            if ws
+                                                .send(Message::Text(meta.to_string().into()))
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                            if ws
+                                                .send(Message::Binary(resp_body.into()))
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        } else {
+                                            let body_b64 = BASE64.encode(&resp_body);
+                                            let response_msg = serde_json::json!({
+                                                "type": "http-response",
+                                                "id": id,
+                                                "status": status,
+                                                "headers": resp_headers,
+                                                "body": body_b64,
+                                            });
+                                            if ws
+                                                .send(Message::Text(
+                                                    response_msg.to_string().into(),
+                                                ))
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
                                     }
                                     Err(e) => {

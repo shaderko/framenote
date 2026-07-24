@@ -28,6 +28,8 @@ const AI_HEADING: &str = "## AI timeline";
 const SUBTITLE_HEADING: &str = "## Subtitles";
 const WAVEFORM_CACHE_VERSION: &str = "waveform-v1-rate100-all-tracks-normalized";
 const WAVEFORM_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const SHARED_STREAM_CACHE_VERSION: &str = "shared-stream-v1-h264-aac-720p";
+const SHARED_STREAM_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const KEYRING_SERVICE: &str = "com.framenote.desktop.ai";
 const EMBEDDED_CHAPTER_IMPORT_VERSION: &str = "embedded-chapters-v1";
 const EMBEDDED_CHAPTER_MARKER: &str = "<!-- framenote:embedded-chapters fingerprint=";
@@ -111,7 +113,14 @@ struct HostedSession {
     code: String,
     token: String,
     service_fullname: String,
+    /// The user's untouched source remains authoritative for sidecar, audio
+    /// mixing, analysis, and export operations.
     video_path: PathBuf,
+    /// Guests receive a bandwidth-bounded H.264/AAC rendition. Serving the
+    /// original here caused audio-only playback whenever its video codec was
+    /// unsupported by the guest's system webview.
+    shared_video_path: PathBuf,
+    shared_content_type: String,
     sidecar_path: PathBuf,
     video_name: String,
     audio_tracks: Vec<AudioTrackInfo>,
@@ -240,6 +249,8 @@ struct NetworkEventRequest {
 struct NetworkJoinResponse {
     token: String,
     video_name: String,
+    #[serde(default = "default_shared_media_content_type")]
+    media_content_type: String,
     markdown: String,
     playback_position: f64,
     audio_tracks: Vec<AudioTrackInfo>,
@@ -492,6 +503,10 @@ fn media_content_type(path: &Path) -> &'static str {
         "mpeg" | "mpg" => "video/mpeg",
         _ => "application/octet-stream",
     }
+}
+
+fn default_shared_media_content_type() -> String {
+    "video/mp4".into()
 }
 
 fn requested_range(request: &Request, size: u64) -> Option<(u64, u64)> {
@@ -1493,22 +1508,75 @@ fn respond_collaboration_request(mut request: Request, hosted: &RwLock<Option<Ho
                 return;
             }
         };
+        let peer_id = join.peer_id;
         runtime.peers.insert(
-            join.peer_id,
+            peer_id.clone(),
             PeerPresence {
                 name: sanitize_metadata(&join.display_name, "Guest"),
                 last_seen: Instant::now(),
             },
         );
+        // A joining guest must become part of the same buffering decision as
+        // everyone already watching. Previously it loaded a stale transport
+        // snapshot and then initiated a second seek, which could rewind the
+        // host (including all the way to zero) and still start before its video
+        // decoder had data.
+        let join_cursor = runtime.sequence;
+        let pending_prepare = if let Some(barrier) = runtime.playback_barrier.as_mut() {
+            barrier.expected.insert(peer_id);
+            Some(PlaybackPreparePayload {
+                operation_id: barrier.operation_id.clone(),
+                position: barrier.transport.position,
+                playing: barrier.transport.playing,
+                playback_rate: barrier.transport.playback_rate,
+            })
+        } else if runtime.transport.playing {
+            prune_peers(&mut runtime);
+            let transport = runtime.transport.clone();
+            let prepare = PlaybackPreparePayload {
+                operation_id: Uuid::new_v4().to_string(),
+                position: transport.position,
+                playing: true,
+                playback_rate: transport.playback_rate,
+            };
+            let mut expected = runtime.peers.keys().cloned().collect::<HashSet<_>>();
+            expected.insert(runtime.host_client_id.clone());
+            runtime.transport = CollaborationTransport {
+                position: transport.position,
+                playing: false,
+                playback_rate: transport.playback_rate,
+            };
+            runtime.playback_barrier = Some(PlaybackBarrier {
+                operation_id: prepare.operation_id.clone(),
+                transport,
+                expected,
+                ready: HashSet::new(),
+            });
+            Some(prepare)
+        } else {
+            None
+        };
+        if let Some(prepare) = pending_prepare {
+            let payload = serde_json::to_value(prepare).unwrap_or_default();
+            queue_collaboration_event(
+                &mut runtime,
+                "framenote-session".into(),
+                "transport-prepare".into(),
+                payload,
+            );
+        }
         let response = NetworkJoinResponse {
             token: session.token.clone(),
             video_name: session.video_name.clone(),
+            media_content_type: session.shared_content_type.clone(),
             markdown: runtime.markdown.clone(),
             playback_position: runtime.transport.position,
             audio_tracks: session.audio_tracks.clone(),
             frame_rate: session.frame_rate,
             transport: runtime.transport.clone(),
-            sequence: runtime.sequence,
+            // The guest begins polling before the prepare event queued above,
+            // ensuring it receives the barrier that now expects its readiness.
+            sequence: join_cursor,
             host_name: session.host_name.clone(),
         };
         drop(runtime);
@@ -1526,7 +1594,7 @@ fn respond_collaboration_request(mut request: Request, hosted: &RwLock<Option<Ho
         return;
     };
     match segments[2] {
-        "media" => respond_local_media(request, &session.video_path, Some(MAX_VIDEO_CHUNK)),
+        "media" => respond_local_media(request, &session.shared_video_path, Some(MAX_VIDEO_CHUNK)),
         "mix" => respond_audio_mix_for_path(request, &session.video_path),
         "events" if request.method() == &Method::Get => {
             let query = parsed.query_pairs().collect::<HashMap<_, _>>();
@@ -1797,6 +1865,169 @@ fn stable_fnv1a(value: &str) -> u64 {
         .fold(0xcbf29ce484222325_u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         })
+}
+
+fn shared_stream_cache_key(video: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(video)
+        .map_err(|error| format!("Could not inspect the video for sharing: {error}"))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    let canonical = video.canonicalize().unwrap_or_else(|_| video.to_path_buf());
+    let identity = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        SHARED_STREAM_CACHE_VERSION,
+        canonical.to_string_lossy(),
+        metadata.len(),
+        modified.as_secs(),
+        modified.subsec_nanos()
+    );
+    Ok(format!("{:016x}.mp4", stable_fnv1a(&identity)))
+}
+
+fn shared_stream_cache_is_fresh(modified: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified)
+        .map(|age| age <= SHARED_STREAM_CACHE_TTL)
+        .unwrap_or(true)
+}
+
+fn prune_shared_stream_cache(cache_dir: &Path) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fresh = entry
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .map(|modified| shared_stream_cache_is_fresh(modified, now))
+            .unwrap_or(false);
+        if !fresh {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn prepare_shared_stream_in_cache(video: &Path, cache_dir: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(cache_dir)
+        .map_err(|error| format!("Could not prepare the shared playback cache: {error}"))?;
+    prune_shared_stream_cache(cache_dir);
+    let output_path = cache_dir.join(shared_stream_cache_key(video)?);
+    if fs::metadata(&output_path)
+        .ok()
+        .filter(|metadata| metadata.len() > 1024)
+        .and_then(|metadata| metadata.modified().ok())
+        .is_some_and(|modified| shared_stream_cache_is_fresh(modified, SystemTime::now()))
+    {
+        return Ok(output_path);
+    }
+    let _ = fs::remove_file(&output_path);
+
+    let ffmpeg = find_executable("ffmpeg").ok_or_else(|| {
+        "FFmpeg is required to create a compatible shared playback stream. Install FFmpeg, then try creating the session again."
+            .to_string()
+    })?;
+    let temporary = cache_dir.join(format!(
+        ".{}.{}.tmp.mp4",
+        output_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("shared-stream"),
+        Uuid::new_v4()
+    ));
+    let video_arg = video.to_string_lossy().into_owned();
+    let temporary_arg = temporary.to_string_lossy().into_owned();
+    let output = StdCommand::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &video_arg,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-sn",
+            "-dn",
+            "-vf",
+            "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-maxrate",
+            "3500k",
+            "-bufsize",
+            "7000k",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "main",
+            "-g",
+            "60",
+            "-keyint_min",
+            "60",
+            "-sc_threshold",
+            "0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-y",
+            &temporary_arg,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .map_err(|error| format!("Could not create the shared playback stream: {error}"))?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary);
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "FFmpeg could not create the compatible shared playback stream.".into()
+        } else {
+            format!("FFmpeg could not create the compatible shared playback stream: {detail}")
+        });
+    }
+    if fs::metadata(&temporary)
+        .map(|metadata| metadata.len() <= 1024)
+        .unwrap_or(true)
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err("FFmpeg produced an empty shared playback stream.".into());
+    }
+    fs::rename(&temporary, &output_path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("Could not save the shared playback stream: {error}")
+    })?;
+    Ok(output_path)
+}
+
+async fn prepare_shared_stream(app: tauri::AppHandle, video: PathBuf) -> Result<PathBuf, String> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("Could not prepare the shared playback cache: {error}"))?
+        .join("shared-streams");
+    tauri::async_runtime::spawn_blocking(move || prepare_shared_stream_in_cache(&video, &cache_dir))
+        .await
+        .map_err(|error| format!("Shared playback preparation stopped unexpectedly: {error}"))?
 }
 
 fn embedded_chapter_fingerprint(video: &Path) -> Result<String, String> {
@@ -2079,7 +2310,8 @@ fn hosted_session_info(
 }
 
 #[tauri::command]
-fn host_collaboration(
+async fn host_collaboration(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     video_path: String,
     display_name: String,
@@ -2132,11 +2364,14 @@ fn host_collaboration(
     if !valid_transport(&initial_transport) {
         return Err("The initial playback state is invalid.".into());
     }
+    let shared_video_path = prepare_shared_stream(app, video.clone()).await?;
     let session = HostedSession {
         code: code.clone(),
         token,
         service_fullname,
         video_path: video,
+        shared_video_path,
+        shared_content_type: default_shared_media_content_type(),
         sidecar_path: sidecar,
         video_name,
         audio_tracks: probe_audio_tracks(Path::new(&video_path)),
@@ -2175,7 +2410,7 @@ fn host_collaboration(
 
 #[tauri::command]
 async fn host_relay_session(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     relay_url: String,
     video_path: String,
@@ -2230,12 +2465,15 @@ async fn host_relay_session(
     if !valid_transport(&initial_transport) {
         return Err("The initial playback state is invalid.".into());
     }
+    let shared_video_path = prepare_shared_stream(app, video.clone()).await?;
 
     let session = HostedSession {
         code: code.clone(),
         token: token.clone(),
         service_fullname: String::new(),
         video_path: video,
+        shared_video_path,
+        shared_content_type: default_shared_media_content_type(),
         sidecar_path: sidecar,
         video_name: video_name.clone(),
         audio_tracks: probe_audio_tracks(Path::new(&video_path)),
@@ -2261,7 +2499,7 @@ async fn host_relay_session(
     let register_video = video_name.clone();
 
     let ws = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
-        // Relay media is split into 2 MiB chunks; keep a small safety margin
+        // Relay media is split into bounded chunks; keep a small safety margin
         // without allowing an accidental whole-video WebSocket allocation.
         let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
         ws_config.max_message_size = Some(4 << 20);
@@ -2606,7 +2844,9 @@ async fn join_collaboration(
         .join(&network.token[..12]);
     fs::create_dir_all(&cache_root)
         .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?;
-    let shadow_video_path = cache_root.join(safe_file_component(&network.video_name, 120));
+    // The host always serves an H.264/AAC MP4 rendition, independently of the
+    // original filename/codec reported to the project UI.
+    let shadow_video_path = cache_root.join("shared-playback.mp4");
     if !shadow_video_path.exists() {
         fs::write(&shadow_video_path, [])
             .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?;
@@ -2625,7 +2865,7 @@ async fn join_collaboration(
             MediaSource::CachedRemote(CachedRemoteMediaSource {
                 media_url: format!("{host_base_url}/session/{}/media", network.token),
                 mix_url: format!("{host_base_url}/session/{}/mix", network.token),
-                content_type: media_content_type(Path::new(&network.video_name)).into(),
+                content_type: network.media_content_type.clone(),
                 cache_path: shadow_video_path.clone(),
                 cache_state: Default::default(),
                 fetch_lock: Default::default(),
@@ -2764,7 +3004,7 @@ async fn join_relay_session(
         .join(&network.token[..12]);
     fs::create_dir_all(&cache_root)
         .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?;
-    let shadow_video_path = cache_root.join(safe_file_component(&network.video_name, 120));
+    let shadow_video_path = cache_root.join("shared-playback.mp4");
     if !shadow_video_path.exists() {
         fs::write(&shadow_video_path, [])
             .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?;
@@ -2783,7 +3023,7 @@ async fn join_relay_session(
             MediaSource::CachedRemote(CachedRemoteMediaSource {
                 media_url: format!("{http_base}/session/{}/media", network.token),
                 mix_url: format!("{http_base}/session/{}/mix", network.token),
-                content_type: media_content_type(Path::new(&network.video_name)).into(),
+                content_type: network.media_content_type.clone(),
                 cache_path: shadow_video_path.clone(),
                 cache_state: Default::default(),
                 fetch_lock: Default::default(),
@@ -5112,7 +5352,9 @@ mod tests {
             code: code.into(),
             token: Uuid::new_v4().to_string(),
             service_fullname: format!("FrameNote test {code}.{COLLABORATION_SERVICE_TYPE}"),
-            video_path: video,
+            video_path: video.clone(),
+            shared_video_path: video,
+            shared_content_type: default_shared_media_content_type(),
             sidecar_path: sidecar,
             video_name: "shared.mp4".into(),
             audio_tracks: Vec::new(),
@@ -5180,6 +5422,104 @@ mod tests {
             now - Duration::from_secs(8 * 24 * 60 * 60),
             now
         ));
+    }
+
+    #[test]
+    fn shared_stream_cache_tracks_source_changes_and_expires() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let video = folder.path().join("source.mov");
+        fs::write(&video, b"first").expect("video fixture");
+        let first = shared_stream_cache_key(&video).expect("first shared stream key");
+        fs::write(&video, b"longer replacement").expect("changed video fixture");
+        let second = shared_stream_cache_key(&video).expect("second shared stream key");
+        assert_ne!(first, second);
+
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        assert!(shared_stream_cache_is_fresh(
+            now - Duration::from_secs(6 * 24 * 60 * 60),
+            now
+        ));
+        assert!(!shared_stream_cache_is_fresh(
+            now - Duration::from_secs(8 * 24 * 60 * 60),
+            now
+        ));
+    }
+
+    #[test]
+    fn shared_stream_is_webview_compatible_and_reused() {
+        let (Some(ffmpeg), Some(ffprobe)) = (find_executable("ffmpeg"), find_executable("ffprobe"))
+        else {
+            return;
+        };
+        let encoders = StdCommand::new(&ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .expect("inspect FFmpeg encoders");
+        if !String::from_utf8_lossy(&encoders.stdout).contains("libx264") {
+            return;
+        }
+
+        let folder = tempfile::tempdir().expect("temp folder");
+        let source = folder.path().join("unsupported-source.mkv");
+        let status = StdCommand::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=30:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "pcm_s16le",
+                "-shortest",
+                "-y",
+            ])
+            .arg(&source)
+            .status()
+            .expect("create source fixture");
+        assert!(status.success());
+
+        let cache = folder.path().join("cache");
+        let shared = prepare_shared_stream_in_cache(&source, &cache)
+            .expect("create compatible shared stream");
+        let reused = prepare_shared_stream_in_cache(&source, &cache)
+            .expect("reuse compatible shared stream");
+        assert_eq!(shared, reused);
+
+        let probe = StdCommand::new(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name,pix_fmt",
+                "-of",
+                "json",
+            ])
+            .arg(&shared)
+            .output()
+            .expect("probe shared stream");
+        assert!(probe.status.success());
+        let json: serde_json::Value =
+            serde_json::from_slice(&probe.stdout).expect("shared stream probe JSON");
+        let streams = json["streams"].as_array().expect("shared streams");
+        let video = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .expect("video stream");
+        let audio = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "audio")
+            .expect("audio stream");
+        assert_eq!(video["codec_name"], "h264");
+        assert_eq!(video["pix_fmt"], "yuv420p");
+        assert_eq!(audio["codec_name"], "aac");
     }
 
     #[test]
@@ -5585,6 +5925,7 @@ mod tests {
             .json::<NetworkJoinResponse>()
             .expect("join response");
         assert_eq!(joined.video_name, "shared.mp4");
+        assert_eq!(joined.media_content_type, "video/mp4");
         assert_eq!(joined.playback_position, 3.5);
 
         let media = client
@@ -5648,6 +5989,68 @@ mod tests {
         let runtime = session.runtime.lock().expect("session runtime");
         assert_eq!(runtime.transport.position, 8.25);
         assert!(runtime.transport.playing);
+        drop(runtime);
+        let _ = service.mdns.shutdown();
+    }
+
+    #[test]
+    fn joining_a_playing_session_enters_the_shared_buffer_barrier() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let service = start_collaboration_service().expect("peer service");
+        let session = collaboration_fixture(&folder, "420739");
+        {
+            let mut runtime = session.runtime.lock().expect("session runtime");
+            runtime.transport = CollaborationTransport {
+                position: 18.75,
+                playing: true,
+                playback_rate: 1.0,
+            };
+        }
+        *service.hosted.write().expect("hosted session") = Some(session.clone());
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("peer client");
+        let base_url = format!("http://127.0.0.1:{}", service.port);
+
+        let joined = client
+            .post(format!("{base_url}/join"))
+            .json(&serde_json::json!({
+                "code": "420739",
+                "peerId": "late-guest",
+                "displayName": "Late Guest"
+            }))
+            .send()
+            .expect("join peer")
+            .error_for_status()
+            .expect("accepted join")
+            .json::<NetworkJoinResponse>()
+            .expect("join response");
+        assert_eq!(joined.transport.position, 18.75);
+        assert!(!joined.transport.playing);
+        assert_eq!(joined.sequence, 0);
+
+        let poll = client
+            .get(format!(
+                "{base_url}/session/{}/events?after={}&peerId=late-guest",
+                session.token, joined.sequence
+            ))
+            .send()
+            .expect("poll prepare")
+            .error_for_status()
+            .expect("accepted poll")
+            .json::<CollaborationPollResult>()
+            .expect("poll response");
+        let prepare = poll
+            .events
+            .iter()
+            .find(|event| event.kind == "transport-prepare")
+            .expect("join prepare event");
+        assert_eq!(prepare.payload["position"], 18.75);
+        let runtime = session.runtime.lock().expect("session runtime");
+        let barrier = runtime.playback_barrier.as_ref().expect("playback barrier");
+        assert!(barrier.expected.contains("host-one"));
+        assert!(barrier.expected.contains("late-guest"));
         drop(runtime);
         let _ = service.mdns.shutdown();
     }
@@ -5893,7 +6296,8 @@ mod tests {
 
         let service = start_collaboration_service().expect("peer service");
         let mut session = collaboration_fixture(&folder, "420734");
-        session.video_path = video;
+        session.video_path = video.clone();
+        session.shared_video_path = video;
         *service.hosted.write().expect("hosted session") = Some(session.clone());
         let proxy = start_media_server().expect("proxy media server");
         proxy.files.write().expect("proxy registry").insert(

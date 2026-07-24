@@ -931,6 +931,7 @@ function App() {
     setCollaborationPhase("hosting");
     localStorage.setItem("framenote:display-name", displayName.trim() || "Host");
     try {
+      showNotice("Preparing a cached, compatible stream for guests. Local playback can continue.");
       const video = videoRef.current;
       const initialPosition = Math.max(0, video?.currentTime ?? currentTimeRef.current);
       const initialPlaybackRate = playbackRate;
@@ -959,6 +960,18 @@ function App() {
           },
         });
       }
+      // Stream preparation may take long enough for the local playhead to have
+      // moved. Refresh the backend snapshot before any guest can join so a
+      // stale creation-time position never rewinds the session.
+      const liveVideo = videoRef.current;
+      await invoke("publish_collaboration_event", {
+        kind: "transport",
+        payload: {
+          position: Math.max(0, liveVideo?.currentTime ?? currentTimeRef.current),
+          playing: liveVideo ? !liveVideo.paused : false,
+          playbackRate: liveVideo?.playbackRate ?? playbackRate,
+        },
+      });
       lastSharedMarkdownRef.current = document.markdown;
       collaborationPollFailuresRef.current = 0;
       setCollaboration(session);
@@ -1510,7 +1523,12 @@ function App() {
   const handleLoadedMetadata = useCallback((video: HTMLVideoElement) => {
     setDuration(video.duration);
     const saved = resumePositionRef.current;
-    const resumeAt = saved > 0 && saved < video.duration - 2 ? saved : 0;
+    // Never reinterpret a valid near-end session position as zero. A joining
+    // guest used to broadcast that zero through the ready barrier and rewind
+    // the host as a side effect.
+    const resumeAt = saved > 0
+      ? Math.min(saved, Math.max(0, video.duration - 0.05))
+      : 0;
     if (resumeAt > 0) {
       video.currentTime = resumeAt;
       currentTimeRef.current = resumeAt;
@@ -3213,7 +3231,7 @@ function CollaborationDialog({
               <div><Users size={15} /><strong>{session.participantCount} watching</strong></div>
               <ul>{session.participants.map((name, index) => <li key={`${name}-${index}`}><i />{name}</li>)}</ul>
             </div>
-            <p className="session-footnote">Playback, seeking, marks, subtitles, and Markdown changes synchronize directly between FrameNote peers. The host keeps the canonical sidecar and serves the original video read-only.</p>
+            <p className="session-footnote">Playback, seeking, marks, subtitles, and Markdown changes synchronize between FrameNote peers. The host keeps the original video and canonical sidecar untouched; guests receive a cached H.264/AAC stream optimized for compatible playback.</p>
             <button className="secondary full session-stop" onClick={onStop}>{session.mode === "host" ? "End session" : "Leave session"}</button>
           </div>
         ) : (

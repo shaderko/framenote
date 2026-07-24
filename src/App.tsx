@@ -157,7 +157,10 @@ interface SubtitleTimingOverride {
   end: number;
 }
 
-const PLAYBACK_BUFFER_AHEAD_SECONDS = 3;
+// WebKit often stops extending `buffered` while paused. Requiring several
+// seconds here can deadlock the ready barrier even while the native cache is
+// successfully reading ahead. The native layer owns the larger prebuffer.
+const PLAYBACK_BUFFER_AHEAD_SECONDS = 0.35;
 
 function hasPlaybackBuffer(video: HTMLVideoElement, time: number) {
   if (video.seeking || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
@@ -175,6 +178,7 @@ function waitForPlaybackBuffer(video: HTMLVideoElement, time: number, timeoutMs 
   if (hasPlaybackBuffer(video, time)) return Promise.resolve(true);
   return new Promise<boolean>((resolve) => {
     let settled = false;
+    const startedAt = performance.now();
     const events: Array<keyof HTMLMediaElementEventMap> = ["canplay", "loadeddata", "progress", "seeked"];
     const finish = (ready: boolean) => {
       if (settled) return;
@@ -185,7 +189,10 @@ function waitForPlaybackBuffer(video: HTMLVideoElement, time: number, timeoutMs 
       resolve(ready);
     };
     const check = () => {
-      if (hasPlaybackBuffer(video, time)) finish(true);
+      const playableFallback = performance.now() - startedAt >= 1_500
+        && !video.seeking
+        && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
+      if (hasPlaybackBuffer(video, time) || playableFallback) finish(true);
     };
     const interval = window.setInterval(check, 120);
     const timeout = window.setTimeout(() => finish(false), timeoutMs);

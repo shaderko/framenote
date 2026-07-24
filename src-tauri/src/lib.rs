@@ -522,7 +522,7 @@ fn requested_range(request: &Request, size: u64) -> Option<(u64, u64)> {
 /// Maximum bytes to serve in a shared video chunk. Local playback is never
 /// capped; only network-facing session responses use this bound.
 const MAX_VIDEO_CHUNK: u64 = 512 * 1024; // 512 KiB keeps relay control traffic responsive.
-const REMOTE_PREFETCH_CHUNKS: usize = 2;
+const REMOTE_PREFETCH_CHUNKS: usize = 8; // 4 MiB ahead at the 512 KiB relay bound.
 
 fn respond_local_media(request: Request, path: &Path, max_range_length: Option<u64>) {
     if !matches!(request.method(), Method::Get | Method::Head) {
@@ -5791,11 +5791,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_media_cache_prefetches_the_next_two_chunks() {
+    fn remote_media_cache_prefetches_the_read_ahead_window() {
         let folder = tempfile::tempdir().expect("temp folder");
         let service = start_collaboration_service().expect("peer service");
         let session = collaboration_fixture(&folder, "420736");
-        let bytes = vec![0x6d; MAX_VIDEO_CHUNK as usize * 3 + 41];
+        let bytes = vec![0x6d; MAX_VIDEO_CHUNK as usize * (REMOTE_PREFETCH_CHUNKS + 1) + 41];
         fs::write(&session.video_path, &bytes).expect("remote media fixture");
         *service.hosted.write().expect("hosted session") = Some(session.clone());
         let proxy = start_media_server().expect("proxy media server");
@@ -5829,13 +5829,15 @@ mod tests {
         assert_eq!(first.bytes().expect("initial body").len(), 1024);
 
         let deadline = Instant::now() + Duration::from_secs(3);
-        while cached_range_end(&source, MAX_VIDEO_CHUNK * 2).is_none() && Instant::now() < deadline
+        let last_prefetched_start = MAX_VIDEO_CHUNK * REMOTE_PREFETCH_CHUNKS as u64;
+        while cached_range_end(&source, last_prefetched_start).is_none()
+            && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(20));
         }
-        let cached_end = cached_range_end(&source, MAX_VIDEO_CHUNK * 2)
-            .expect("two chunks should be prefetched after the active chunk");
-        assert!(cached_end >= MAX_VIDEO_CHUNK * 3 - 1);
+        let cached_end = cached_range_end(&source, last_prefetched_start)
+            .expect("the read-ahead window should be prefetched after the active chunk");
+        assert!(cached_end >= MAX_VIDEO_CHUNK * (REMOTE_PREFETCH_CHUNKS as u64 + 1) - 1);
 
         *service.hosted.write().expect("remove host") = None;
         let cached = client
@@ -5844,8 +5846,8 @@ mod tests {
                 "Range",
                 format!(
                     "bytes={}-{}",
-                    MAX_VIDEO_CHUNK * 2,
-                    MAX_VIDEO_CHUNK * 2 + 1023
+                    last_prefetched_start,
+                    last_prefetched_start + 1023
                 ),
             )
             .send()

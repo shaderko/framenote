@@ -1,7 +1,8 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     net::TcpListener,
@@ -9,7 +10,7 @@ use std::{
     process::{Child, ChildStdout, Command as StdCommand, Stdio},
     sync::{Arc, Mutex, RwLock},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, State};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -26,27 +27,173 @@ const WAVEFORM_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const KEYRING_SERVICE: &str = "com.framenote.desktop.ai";
 const EMBEDDED_CHAPTER_IMPORT_VERSION: &str = "embedded-chapters-v1";
 const EMBEDDED_CHAPTER_MARKER: &str = "<!-- framenote:embedded-chapters fingerprint=";
+const COLLABORATION_SERVICE_TYPE: &str = "_framenote._tcp.local.";
+const COLLABORATION_EVENT_LIMIT: usize = 1024;
+const COLLABORATION_PEER_TTL: Duration = Duration::from_secs(12);
 
 struct AppState {
     jobs: Mutex<HashMap<String, CancellationToken>>,
     media: MediaServer,
+    collaboration: CollaborationService,
 }
 
+#[derive(Clone)]
 struct MediaServer {
     base_url: String,
-    files: Arc<RwLock<HashMap<String, PathBuf>>>,
+    files: Arc<RwLock<HashMap<String, MediaSource>>>,
 }
 
 impl AppState {
-    fn new(media: MediaServer) -> Self {
+    fn new(media: MediaServer, collaboration: CollaborationService) -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
             media,
+            collaboration,
         }
     }
 }
 
+#[derive(Clone)]
+enum MediaSource {
+    Local(PathBuf),
+    Remote(RemoteMediaSource),
+}
+
+#[derive(Clone)]
+struct RemoteMediaSource {
+    media_url: String,
+    mix_url: String,
+    content_type: String,
+}
+
+#[derive(Clone)]
+struct CollaborationService {
+    mdns: ServiceDaemon,
+    port: u16,
+    hosted: Arc<RwLock<Option<HostedSession>>>,
+    joined: Arc<Mutex<Option<JoinedSession>>>,
+    host_cursor: Arc<Mutex<u64>>,
+    client_id: String,
+}
+
+#[derive(Clone)]
+struct HostedSession {
+    code: String,
+    token: String,
+    service_fullname: String,
+    video_path: PathBuf,
+    sidecar_path: PathBuf,
+    video_name: String,
+    audio_tracks: Vec<AudioTrackInfo>,
+    frame_rate: Option<f64>,
+    host_name: String,
+    runtime: Arc<Mutex<HostedSessionRuntime>>,
+}
+
+struct HostedSessionRuntime {
+    sequence: u64,
+    document_revision: u64,
+    markdown: String,
+    transport: CollaborationTransport,
+    events: VecDeque<CollaborationEvent>,
+    peers: HashMap<String, PeerPresence>,
+}
+
+struct PeerPresence {
+    name: String,
+    last_seen: Instant,
+}
+
+#[derive(Clone)]
+struct JoinedSession {
+    code: String,
+    token: String,
+    host_base_url: String,
+    video_name: String,
+    shadow_sidecar_path: PathBuf,
+    peer_id: String,
+    display_name: String,
+    cursor: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollaborationTransport {
+    position: f64,
+    playing: bool,
+    playback_rate: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollaborationEvent {
+    sequence: u64,
+    sender_id: String,
+    kind: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollaborationSessionInfo {
+    mode: String,
+    code: String,
+    participant_count: usize,
+    video_name: String,
+    display_name: String,
+    client_id: String,
+    participants: Vec<String>,
+}
+
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinCollaborationResult {
+    document: SidecarDocument,
+    media_registration: MediaRegistration,
+    session: CollaborationSessionInfo,
+    transport: CollaborationTransport,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollaborationPollResult {
+    events: Vec<CollaborationEvent>,
+    participant_count: usize,
+    participants: Vec<String>,
+    connected: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkJoinRequest {
+    code: String,
+    peer_id: String,
+    display_name: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkEventRequest {
+    peer_id: String,
+    kind: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkJoinResponse {
+    token: String,
+    video_name: String,
+    markdown: String,
+    playback_position: f64,
+    audio_tracks: Vec<AudioTrackInfo>,
+    frame_rate: Option<f64>,
+    transport: CollaborationTransport,
+    sequence: u64,
+    host_name: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SidecarDocument {
     video_path: String,
@@ -161,7 +308,7 @@ struct ExportManifestClip {
     label: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioTrackInfo {
     stream_index: u32,
@@ -171,7 +318,7 @@ struct AudioTrackInfo {
     channels: Option<u32>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaRegistration {
     url: String,
@@ -316,28 +463,12 @@ fn requested_range(request: &Request, size: u64) -> Option<(u64, u64)> {
     (start < size && start <= end).then_some((start, end))
 }
 
-fn respond_media(request: Request, files: &RwLock<HashMap<String, PathBuf>>) {
-    let token = request
-        .url()
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .strip_prefix("/media/")
-        .unwrap_or_default();
-    let path = files
-        .read()
-        .ok()
-        .and_then(|files| files.get(token).cloned());
-    let Some(path) = path else {
-        let _ = request.respond(Response::empty(StatusCode(404)));
-        return;
-    };
+fn respond_local_media(request: Request, path: &Path) {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let _ = request.respond(Response::empty(StatusCode(405)));
         return;
     }
-
-    let Ok(mut file) = File::open(&path) else {
+    let Ok(mut file) = File::open(path) else {
         let _ = request.respond(Response::empty(StatusCode(404)));
         return;
     };
@@ -358,7 +489,7 @@ fn respond_media(request: Request, files: &RwLock<HashMap<String, PathBuf>>) {
     let length = end - start + 1;
     let mut headers = vec![
         header("Accept-Ranges", "bytes"),
-        header("Content-Type", media_content_type(&path)),
+        header("Content-Type", media_content_type(path)),
         header("Cache-Control", "no-store"),
         header("Access-Control-Allow-Origin", "*"),
     ];
@@ -391,22 +522,101 @@ fn respond_media(request: Request, files: &RwLock<HashMap<String, PathBuf>>) {
     ));
 }
 
-fn respond_audio_mix(request: Request, files: &RwLock<HashMap<String, PathBuf>>) {
+fn respond_remote_proxy(request: Request, url: &str, fallback_content_type: &str) {
+    if !matches!(request.method(), Method::Get | Method::Head) {
+        let _ = request.respond(Response::empty(StatusCode(405)));
+        return;
+    }
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(60))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            let _ = request.respond(Response::empty(StatusCode(503)));
+            return;
+        }
+    };
+    let mut outbound = if request.method() == &Method::Head {
+        client.head(url)
+    } else {
+        client.get(url)
+    };
+    if let Some(range) = request
+        .headers()
+        .iter()
+        .find(|candidate| candidate.field.equiv("Range"))
+    {
+        outbound = outbound.header(reqwest::header::RANGE, range.value.as_str());
+    }
+    let response = match outbound.send() {
+        Ok(response) => response,
+        Err(_) => {
+            let _ = request.respond(
+                Response::from_string("The sharing peer is unavailable.").with_status_code(503),
+            );
+            return;
+        }
+    };
+    let status = StatusCode(response.status().as_u16());
+    let length = response
+        .content_length()
+        .and_then(|value| usize::try_from(value).ok());
+    let mut headers = vec![
+        header("Accept-Ranges", "bytes"),
+        header("Cache-Control", "no-store"),
+        header("Access-Control-Allow-Origin", "*"),
+        header(
+            "Content-Type",
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(fallback_content_type),
+        ),
+    ];
+    if let Some(value) = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        headers.push(header("Content-Range", value));
+    }
+    let _ = request.respond(Response::new(status, headers, response, length, None));
+}
+
+fn respond_media(request: Request, files: &RwLock<HashMap<String, MediaSource>>) {
+    let token = request
+        .url()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .strip_prefix("/media/")
+        .unwrap_or_default();
+    let source = files
+        .read()
+        .ok()
+        .and_then(|files| files.get(token).cloned());
+    let Some(source) = source else {
+        let _ = request.respond(Response::empty(StatusCode(404)));
+        return;
+    };
+    match source {
+        MediaSource::Local(path) => respond_local_media(request, &path),
+        MediaSource::Remote(remote) => {
+            respond_remote_proxy(request, &remote.media_url, &remote.content_type)
+        }
+    }
+}
+
+fn respond_audio_mix_for_path(request: Request, path: &Path) {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let _ = request.respond(Response::empty(StatusCode(405)));
         return;
     }
     let Ok(parsed) = url::Url::parse(&format!("http://localhost{}", request.url())) else {
         let _ = request.respond(Response::empty(StatusCode(400)));
-        return;
-    };
-    let token = parsed.path().strip_prefix("/mix/").unwrap_or_default();
-    let path = files
-        .read()
-        .ok()
-        .and_then(|files| files.get(token).cloned());
-    let Some(path) = path else {
-        let _ = request.respond(Response::empty(StatusCode(404)));
         return;
     };
     let query = parsed.query_pairs().collect::<HashMap<_, _>>();
@@ -526,7 +736,33 @@ fn respond_audio_mix(request: Request, files: &RwLock<HashMap<String, PathBuf>>)
     let _ = request.respond(Response::new(StatusCode(200), headers, reader, None, None));
 }
 
-fn respond_request(request: Request, files: &RwLock<HashMap<String, PathBuf>>) {
+fn respond_audio_mix(request: Request, files: &RwLock<HashMap<String, MediaSource>>) {
+    let Ok(parsed) = url::Url::parse(&format!("http://localhost{}", request.url())) else {
+        let _ = request.respond(Response::empty(StatusCode(400)));
+        return;
+    };
+    let token = parsed.path().strip_prefix("/mix/").unwrap_or_default();
+    let source = files
+        .read()
+        .ok()
+        .and_then(|files| files.get(token).cloned());
+    let Some(source) = source else {
+        let _ = request.respond(Response::empty(StatusCode(404)));
+        return;
+    };
+    match source {
+        MediaSource::Local(path) => respond_audio_mix_for_path(request, &path),
+        MediaSource::Remote(remote) => {
+            let url = parsed
+                .query()
+                .map(|query| format!("{}?{query}", remote.mix_url))
+                .unwrap_or(remote.mix_url);
+            respond_remote_proxy(request, &url, "audio/aac");
+        }
+    }
+}
+
+fn respond_request(request: Request, files: &RwLock<HashMap<String, MediaSource>>) {
     if request.url().starts_with("/media/") {
         respond_media(request, files);
     } else if request.url().starts_with("/mix/") {
@@ -559,6 +795,296 @@ fn start_media_server() -> Result<MediaServer, String> {
     Ok(MediaServer {
         base_url: format!("http://127.0.0.1:{port}"),
         files,
+    })
+}
+
+fn respond_json<T: Serialize>(request: Request, status: u16, value: &T) {
+    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    let response = Response::from_data(body)
+        .with_status_code(status)
+        .with_header(header("Content-Type", "application/json"))
+        .with_header(header("Cache-Control", "no-store"))
+        .with_header(header("Access-Control-Allow-Origin", "*"));
+    let _ = request.respond(response);
+}
+
+fn read_request_json<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result<T, String> {
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take(8 * 1024 * 1024)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("Could not read peer request: {error}"))?;
+    serde_json::from_slice(&body).map_err(|error| format!("Invalid peer request: {error}"))
+}
+
+fn prune_peers(runtime: &mut HostedSessionRuntime) {
+    runtime
+        .peers
+        .retain(|_, peer| peer.last_seen.elapsed() <= COLLABORATION_PEER_TTL);
+}
+
+fn participant_count(runtime: &mut HostedSessionRuntime) -> usize {
+    prune_peers(runtime);
+    1 + runtime.peers.len()
+}
+
+fn participant_names(runtime: &mut HostedSessionRuntime, host_name: &str) -> Vec<String> {
+    prune_peers(runtime);
+    let mut names = vec![host_name.to_string()];
+    names.extend(runtime.peers.values().map(|peer| peer.name.clone()));
+    names.sort();
+    names
+}
+
+fn publish_host_event(
+    session: &HostedSession,
+    sender_id: String,
+    kind: String,
+    payload: serde_json::Value,
+) -> Result<Option<CollaborationEvent>, String> {
+    if !matches!(kind.as_str(), "transport" | "document") {
+        return Err("Unsupported collaboration event.".into());
+    }
+    let mut runtime = session
+        .runtime
+        .lock()
+        .map_err(|_| "The collaboration session is unavailable.".to_string())?;
+    if kind == "transport" {
+        let transport = serde_json::from_value::<CollaborationTransport>(payload.clone())
+            .map_err(|_| "The synchronized playback state is invalid.".to_string())?;
+        if !transport.position.is_finite()
+            || transport.position < 0.0
+            || !transport.playback_rate.is_finite()
+            || !(0.25..=4.0).contains(&transport.playback_rate)
+        {
+            return Err("The synchronized playback state is invalid.".into());
+        }
+        runtime.transport = transport;
+    } else {
+        let markdown = payload["markdown"]
+            .as_str()
+            .ok_or_else(|| "The shared Markdown update is invalid.".to_string())?;
+        if markdown.len() > 8 * 1024 * 1024 {
+            return Err("The shared Markdown update is too large.".into());
+        }
+        if markdown == runtime.markdown {
+            return Ok(None);
+        }
+        fs::write(&session.sidecar_path, markdown).map_err(|error| {
+            format!(
+                "Could not save the shared Markdown to {}: {error}",
+                session.sidecar_path.display()
+            )
+        })?;
+        runtime.markdown = markdown.to_string();
+        runtime.document_revision += 1;
+    }
+
+    runtime.sequence += 1;
+    let event = CollaborationEvent {
+        sequence: runtime.sequence,
+        sender_id,
+        kind,
+        payload,
+    };
+    runtime.events.push_back(event.clone());
+    while runtime.events.len() > COLLABORATION_EVENT_LIMIT {
+        runtime.events.pop_front();
+    }
+    Ok(Some(event))
+}
+
+fn collaboration_session_for_token(
+    hosted: &RwLock<Option<HostedSession>>,
+    token: &str,
+) -> Option<HostedSession> {
+    hosted.read().ok().and_then(|session| {
+        session
+            .as_ref()
+            .filter(|session| session.token == token)
+            .cloned()
+    })
+}
+
+fn respond_collaboration_request(mut request: Request, hosted: &RwLock<Option<HostedSession>>) {
+    let Ok(parsed) = url::Url::parse(&format!("http://localhost{}", request.url())) else {
+        let _ = request.respond(Response::empty(StatusCode(400)));
+        return;
+    };
+    let path = parsed.path().to_string();
+    if path == "/join" {
+        if request.method() != &Method::Post {
+            let _ = request.respond(Response::empty(StatusCode(405)));
+            return;
+        }
+        let join = match read_request_json::<NetworkJoinRequest>(&mut request) {
+            Ok(join) => join,
+            Err(error) => {
+                respond_json(request, 400, &serde_json::json!({ "error": error }));
+                return;
+            }
+        };
+        let session = hosted.read().ok().and_then(|session| session.clone());
+        let Some(session) = session.filter(|session| session.code == join.code) else {
+            respond_json(
+                request,
+                403,
+                &serde_json::json!({ "error": "Session code not found." }),
+            );
+            return;
+        };
+        let mut runtime = match session.runtime.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                respond_json(
+                    request,
+                    503,
+                    &serde_json::json!({ "error": "Session unavailable." }),
+                );
+                return;
+            }
+        };
+        runtime.peers.insert(
+            join.peer_id,
+            PeerPresence {
+                name: sanitize_metadata(&join.display_name, "Guest"),
+                last_seen: Instant::now(),
+            },
+        );
+        let response = NetworkJoinResponse {
+            token: session.token.clone(),
+            video_name: session.video_name.clone(),
+            markdown: runtime.markdown.clone(),
+            playback_position: runtime.transport.position,
+            audio_tracks: session.audio_tracks.clone(),
+            frame_rate: session.frame_rate,
+            transport: runtime.transport.clone(),
+            sequence: runtime.sequence,
+            host_name: session.host_name.clone(),
+        };
+        drop(runtime);
+        respond_json(request, 200, &response);
+        return;
+    }
+
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.len() != 3 || segments[0] != "session" {
+        let _ = request.respond(Response::empty(StatusCode(404)));
+        return;
+    }
+    let Some(session) = collaboration_session_for_token(hosted, segments[1]) else {
+        let _ = request.respond(Response::empty(StatusCode(404)));
+        return;
+    };
+    match segments[2] {
+        "media" => respond_local_media(request, &session.video_path),
+        "mix" => respond_audio_mix_for_path(request, &session.video_path),
+        "events" if request.method() == &Method::Get => {
+            let query = parsed.query_pairs().collect::<HashMap<_, _>>();
+            let after = query
+                .get("after")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            let peer_id = query.get("peerId").map(|value| value.to_string());
+            let mut runtime = match session.runtime.lock() {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    respond_json(
+                        request,
+                        503,
+                        &serde_json::json!({ "error": "Session unavailable." }),
+                    );
+                    return;
+                }
+            };
+            if let Some(peer_id) = peer_id {
+                if let Some(peer) = runtime.peers.get_mut(&peer_id) {
+                    peer.last_seen = Instant::now();
+                }
+            }
+            let events = runtime
+                .events
+                .iter()
+                .filter(|event| event.sequence > after)
+                .cloned()
+                .collect::<Vec<_>>();
+            let count = participant_count(&mut runtime);
+            let participants = participant_names(&mut runtime, &session.host_name);
+            drop(runtime);
+            respond_json(
+                request,
+                200,
+                &CollaborationPollResult {
+                    events,
+                    participant_count: count,
+                    participants,
+                    connected: true,
+                },
+            );
+        }
+        "event" if request.method() == &Method::Post => {
+            let event = match read_request_json::<NetworkEventRequest>(&mut request) {
+                Ok(event) => event,
+                Err(error) => {
+                    respond_json(request, 400, &serde_json::json!({ "error": error }));
+                    return;
+                }
+            };
+            if let Ok(mut runtime) = session.runtime.lock() {
+                if let Some(peer) = runtime.peers.get_mut(&event.peer_id) {
+                    peer.last_seen = Instant::now();
+                }
+            }
+            match publish_host_event(&session, event.peer_id, event.kind, event.payload) {
+                Ok(_) => respond_json(request, 200, &serde_json::json!({ "accepted": true })),
+                Err(error) => respond_json(request, 400, &serde_json::json!({ "error": error })),
+            }
+        }
+        "leave" if request.method() == &Method::Post => {
+            let body = read_request_json::<serde_json::Value>(&mut request).unwrap_or_default();
+            if let Some(peer_id) = body["peerId"].as_str() {
+                if let Ok(mut runtime) = session.runtime.lock() {
+                    runtime.peers.remove(peer_id);
+                }
+            }
+            respond_json(request, 200, &serde_json::json!({ "left": true }));
+        }
+        _ => {
+            let _ = request.respond(Response::empty(StatusCode(404)));
+        }
+    }
+}
+
+fn start_collaboration_service() -> Result<CollaborationService, String> {
+    let listener = TcpListener::bind(("0.0.0.0", 0))
+        .map_err(|error| format!("Could not start peer sharing: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("Could not read the peer sharing address: {error}"))?
+        .port();
+    let server = Server::from_listener(listener, None)
+        .map_err(|error| format!("Could not start peer sharing: {error}"))?;
+    let hosted = Arc::new(RwLock::new(None));
+    let server_hosted = Arc::clone(&hosted);
+    thread::Builder::new()
+        .name("framenote-peer".into())
+        .spawn(move || {
+            for request in server.incoming_requests() {
+                let request_hosted = Arc::clone(&server_hosted);
+                thread::spawn(move || respond_collaboration_request(request, &request_hosted));
+            }
+        })
+        .map_err(|error| format!("Could not start the peer sharing thread: {error}"))?;
+    let mdns = ServiceDaemon::new()
+        .map_err(|error| format!("Could not start local session discovery: {error}"))?;
+    Ok(CollaborationService {
+        mdns,
+        port,
+        hosted,
+        joined: Arc::new(Mutex::new(None)),
+        host_cursor: Arc::new(Mutex::new(0)),
+        client_id: Uuid::new_v4().to_string(),
     })
 }
 
@@ -854,8 +1380,10 @@ fn merge_embedded_chapters(
     chapters: &[EmbeddedChapter],
     fingerprint: &str,
 ) -> Option<String> {
-    let current_marker = format!("{EMBEDDED_CHAPTER_MARKER}{fingerprint} -->");
-    if markdown.lines().any(|line| line.trim() == current_marker) {
+    if markdown
+        .lines()
+        .any(|line| line.trim().starts_with(EMBEDDED_CHAPTER_MARKER))
+    {
         return None;
     }
 
@@ -965,6 +1493,517 @@ async fn pick_export_directory() -> Result<Option<String>, String> {
     .map_err(|error| format!("The folder picker failed: {error}"))
 }
 
+fn six_digit_session_code() -> String {
+    let bytes = *Uuid::new_v4().as_bytes();
+    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
+    format!("{value:06}")
+}
+
+fn hosted_session_info(
+    service: &CollaborationService,
+    session: &HostedSession,
+) -> CollaborationSessionInfo {
+    let participant_count = session
+        .runtime
+        .lock()
+        .map(|mut runtime| participant_count(&mut runtime))
+        .unwrap_or(1);
+    CollaborationSessionInfo {
+        mode: "host".into(),
+        code: session.code.clone(),
+        participant_count,
+        video_name: session.video_name.clone(),
+        display_name: session.host_name.clone(),
+        client_id: service.client_id.clone(),
+        participants: session
+            .runtime
+            .lock()
+            .map(|mut runtime| participant_names(&mut runtime, &session.host_name))
+            .unwrap_or_else(|_| vec![session.host_name.clone()]),
+    }
+}
+
+#[tauri::command]
+fn host_collaboration(
+    state: State<'_, AppState>,
+    video_path: String,
+    display_name: String,
+) -> Result<CollaborationSessionInfo, String> {
+    if state
+        .collaboration
+        .joined
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .is_some()
+    {
+        return Err("Leave the current shared session before hosting another one.".into());
+    }
+    if state
+        .collaboration
+        .hosted
+        .read()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .is_some()
+    {
+        return Err("This project is already being shared.".into());
+    }
+    let video = validate_video_path(&video_path)?;
+    let (sidecar, markdown) = read_or_create_markdown(&video)?;
+    let video_name = video
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Shared video")
+        .to_string();
+    let code = six_digit_session_code();
+    let token = Uuid::new_v4().to_string();
+    let instance_name = format!("FrameNote {code} {}", &token[..6]);
+    let host_name = format!("framenote-{}.local.", &token[..8]);
+    let mut properties = HashMap::new();
+    properties.insert("code".to_string(), code.clone());
+    properties.insert("version".to_string(), "1".to_string());
+    let service_info = ServiceInfo::new(
+        COLLABORATION_SERVICE_TYPE,
+        &instance_name,
+        &host_name,
+        "",
+        state.collaboration.port,
+        properties,
+    )
+    .map_err(|error| format!("Could not publish the local session: {error}"))?
+    .enable_addr_auto();
+    let service_fullname = service_info.get_fullname().to_string();
+    let host_name_label = sanitize_metadata(&display_name, "Host");
+    let session = HostedSession {
+        code: code.clone(),
+        token,
+        service_fullname,
+        video_path: video,
+        sidecar_path: sidecar,
+        video_name,
+        audio_tracks: probe_audio_tracks(Path::new(&video_path)),
+        frame_rate: probe_frame_rate(Path::new(&video_path)),
+        host_name: host_name_label,
+        runtime: Arc::new(Mutex::new(HostedSessionRuntime {
+            sequence: 0,
+            document_revision: 0,
+            markdown: markdown.clone(),
+            transport: CollaborationTransport {
+                position: playback_position(&markdown),
+                playing: false,
+                playback_rate: 1.0,
+            },
+            events: VecDeque::new(),
+            peers: HashMap::new(),
+        })),
+    };
+    *state
+        .collaboration
+        .hosted
+        .write()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())? =
+        Some(session.clone());
+    *state
+        .collaboration
+        .host_cursor
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())? = 0;
+    if let Err(error) = state.collaboration.mdns.register(service_info) {
+        if let Ok(mut hosted) = state.collaboration.hosted.write() {
+            *hosted = None;
+        }
+        return Err(format!("Could not advertise the local session: {error}"));
+    }
+    Ok(hosted_session_info(&state.collaboration, &session))
+}
+
+fn join_discovered_session(
+    service: &CollaborationService,
+    code: &str,
+    display_name: &str,
+) -> Result<(NetworkJoinResponse, String), String> {
+    let receiver = service
+        .mdns
+        .browse(COLLABORATION_SERVICE_TYPE)
+        .map_err(|error| format!("Could not search for local sessions: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| format!("Could not prepare peer connection: {error}"))?;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = receiver.recv_timeout(remaining.min(Duration::from_millis(750)));
+        let Ok(ServiceEvent::ServiceResolved(info)) = event else {
+            continue;
+        };
+        if info.get_property_val_str("code") != Some(code) {
+            continue;
+        }
+        for address in info.get_addresses_v4() {
+            let base_url = format!("http://{}:{}", address, info.get_port());
+            let response = client
+                .post(format!("{base_url}/join"))
+                .json(&serde_json::json!({
+                    "code": code,
+                    "peerId": service.client_id,
+                    "displayName": display_name,
+                }))
+                .send();
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let joined = response.json::<NetworkJoinResponse>().map_err(|error| {
+                        format!("The sharing peer returned invalid session data: {error}")
+                    })?;
+                    let _ = service.mdns.stop_browse(COLLABORATION_SERVICE_TYPE);
+                    return Ok((joined, base_url));
+                }
+                Ok(response) => {
+                    last_error = Some(format!(
+                        "The sharing peer rejected the connection ({})",
+                        response.status()
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(format!("Could not connect to the sharing peer: {error}"))
+                }
+            }
+        }
+    }
+    let _ = service.mdns.stop_browse(COLLABORATION_SERVICE_TYPE);
+    Err(last_error.unwrap_or_else(|| {
+        "No FrameNote session with that code was found on this local network.".into()
+    }))
+}
+
+#[tauri::command]
+async fn join_collaboration(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    code: String,
+    display_name: String,
+) -> Result<JoinCollaborationResult, String> {
+    let code = code.trim().to_string();
+    if code.len() != 6 || !code.chars().all(|character| character.is_ascii_digit()) {
+        return Err("Enter the six-digit session code.".into());
+    }
+    if state
+        .collaboration
+        .hosted
+        .read()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .is_some()
+    {
+        return Err("Stop hosting before joining another session.".into());
+    }
+    if state
+        .collaboration
+        .joined
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .is_some()
+    {
+        return Err("Leave the current session before joining another one.".into());
+    }
+    let service = state.collaboration.clone();
+    let display_name = sanitize_metadata(&display_name, "Guest");
+    let join_name = display_name.clone();
+    let discovery_code = code.clone();
+    let (network, host_base_url) = tauri::async_runtime::spawn_blocking(move || {
+        join_discovered_session(&service, &discovery_code, &join_name)
+    })
+    .await
+    .map_err(|error| format!("The local session search stopped unexpectedly: {error}"))??;
+
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?
+        .join("collaboration")
+        .join(&network.token[..12]);
+    fs::create_dir_all(&cache_root)
+        .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?;
+    let shadow_video_path = cache_root.join(safe_file_component(&network.video_name, 120));
+    if !shadow_video_path.exists() {
+        fs::write(&shadow_video_path, [])
+            .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?;
+    }
+    let shadow_sidecar_path = shadow_video_path.with_extension("md");
+    fs::write(&shadow_sidecar_path, &network.markdown)
+        .map_err(|error| format!("Could not cache the shared Markdown: {error}"))?;
+    let media_token = Uuid::new_v4().to_string();
+    state
+        .media
+        .files
+        .write()
+        .map_err(|_| "The private media server is unavailable.".to_string())?
+        .insert(
+            media_token.clone(),
+            MediaSource::Remote(RemoteMediaSource {
+                media_url: format!("{host_base_url}/session/{}/media", network.token),
+                mix_url: format!("{host_base_url}/session/{}/mix", network.token),
+                content_type: media_content_type(Path::new(&network.video_name)).into(),
+            }),
+        );
+    let joined = JoinedSession {
+        code: code.clone(),
+        token: network.token.clone(),
+        host_base_url,
+        video_name: network.video_name.clone(),
+        shadow_sidecar_path: shadow_sidecar_path.clone(),
+        peer_id: state.collaboration.client_id.clone(),
+        display_name: display_name.clone(),
+        cursor: network.sequence,
+    };
+    *state
+        .collaboration
+        .joined
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())? = Some(joined);
+    let initial_transport = network.transport.clone();
+    let document = SidecarDocument {
+        video_path: shadow_video_path.to_string_lossy().into_owned(),
+        video_name: network.video_name.clone(),
+        sidecar_path: shadow_sidecar_path.to_string_lossy().into_owned(),
+        markdown: network.markdown,
+        playback_position: network.transport.position,
+    };
+    Ok(JoinCollaborationResult {
+        document,
+        media_registration: MediaRegistration {
+            url: format!("{}/media/{media_token}", state.media.base_url),
+            mix_base_url: format!("{}/mix/{media_token}", state.media.base_url),
+            audio_tracks: network.audio_tracks,
+            frame_rate: network.frame_rate,
+        },
+        session: CollaborationSessionInfo {
+            mode: "guest".into(),
+            code,
+            participant_count: 2,
+            video_name: network.video_name,
+            display_name: display_name.clone(),
+            client_id: state.collaboration.client_id.clone(),
+            participants: vec![network.host_name, display_name],
+        },
+        transport: initial_transport,
+    })
+}
+
+fn poll_collaboration_service(
+    service: &CollaborationService,
+) -> Result<CollaborationPollResult, String> {
+    if let Some(session) = service
+        .hosted
+        .read()
+        .ok()
+        .and_then(|session| session.clone())
+    {
+        let mut cursor = service
+            .host_cursor
+            .lock()
+            .map_err(|_| "The collaboration cursor is unavailable.".to_string())?;
+        let mut runtime = session
+            .runtime
+            .lock()
+            .map_err(|_| "The collaboration session is unavailable.".to_string())?;
+        let events = runtime
+            .events
+            .iter()
+            .filter(|event| event.sequence > *cursor)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(event) = events.last() {
+            *cursor = event.sequence;
+        }
+        let count = participant_count(&mut runtime);
+        let participants = participant_names(&mut runtime, &session.host_name);
+        return Ok(CollaborationPollResult {
+            events,
+            participant_count: count,
+            participants,
+            connected: true,
+        });
+    }
+    let joined = service
+        .joined
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .clone()
+        .ok_or_else(|| "No shared session is active.".to_string())?;
+    let url = format!(
+        "{}/session/{}/events?after={}&peerId={}",
+        joined.host_base_url, joined.token, joined.cursor, joined.peer_id
+    );
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(4))
+        .build()
+        .map_err(|error| format!("Could not prepare the peer connection: {error}"))?
+        .get(url)
+        .send()
+        .map_err(|_| "The sharing peer is unavailable on the local network.".to_string())?;
+    if !response.status().is_success() {
+        return Err("The sharing peer ended this session.".into());
+    }
+    let result = response
+        .json::<CollaborationPollResult>()
+        .map_err(|error| format!("The sharing peer returned invalid updates: {error}"))?;
+    if let Some(event) = result.events.last() {
+        if let Ok(mut current) = service.joined.lock() {
+            if let Some(current) = current
+                .as_mut()
+                .filter(|current| current.token == joined.token)
+            {
+                current.cursor = event.sequence;
+            }
+        }
+    }
+    for event in &result.events {
+        if event.kind == "document" {
+            if let Some(markdown) = event.payload["markdown"].as_str() {
+                let _ = fs::write(&joined.shadow_sidecar_path, markdown);
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn poll_collaboration(state: State<'_, AppState>) -> Result<CollaborationPollResult, String> {
+    let service = state.collaboration.clone();
+    tauri::async_runtime::spawn_blocking(move || poll_collaboration_service(&service))
+        .await
+        .map_err(|error| format!("The peer update task stopped unexpectedly: {error}"))?
+}
+
+fn publish_collaboration_event_service(
+    service: &CollaborationService,
+    kind: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    if let Some(session) = service
+        .hosted
+        .read()
+        .ok()
+        .and_then(|session| session.clone())
+    {
+        publish_host_event(&session, service.client_id.clone(), kind, payload)?;
+        return Ok(());
+    }
+    let joined = service
+        .joined
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .clone()
+        .ok_or_else(|| "No shared session is active.".to_string())?;
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| format!("Could not prepare the peer connection: {error}"))?
+        .post(format!(
+            "{}/session/{}/event",
+            joined.host_base_url, joined.token
+        ))
+        .json(&NetworkEventRequest {
+            peer_id: joined.peer_id,
+            kind,
+            payload,
+        })
+        .send()
+        .map_err(|_| "The sharing peer is unavailable on the local network.".to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err("The sharing peer rejected this update.".into())
+    }
+}
+
+#[tauri::command]
+async fn publish_collaboration_event(
+    state: State<'_, AppState>,
+    kind: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let service = state.collaboration.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        publish_collaboration_event_service(&service, kind, payload)
+    })
+    .await
+    .map_err(|error| format!("The peer update task stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+fn collaboration_status(
+    state: State<'_, AppState>,
+) -> Result<Option<CollaborationSessionInfo>, String> {
+    if let Some(session) = state
+        .collaboration
+        .hosted
+        .read()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .clone()
+    {
+        return Ok(Some(hosted_session_info(&state.collaboration, &session)));
+    }
+    let joined = state
+        .collaboration
+        .joined
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .clone();
+    Ok(joined.map(|joined| {
+        let participants = vec![joined.display_name.clone()];
+        CollaborationSessionInfo {
+            mode: "guest".into(),
+            code: joined.code,
+            participant_count: 1,
+            video_name: joined.video_name,
+            display_name: joined.display_name,
+            client_id: state.collaboration.client_id.clone(),
+            participants,
+        }
+    }))
+}
+
+#[tauri::command]
+fn stop_collaboration(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(session) = state
+        .collaboration
+        .hosted
+        .write()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .take()
+    {
+        let _ = state
+            .collaboration
+            .mdns
+            .unregister(&session.service_fullname);
+    }
+    if let Some(joined) = state
+        .collaboration
+        .joined
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .take()
+    {
+        let _ = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .and_then(|client| {
+                client
+                    .post(format!(
+                        "{}/session/{}/leave",
+                        joined.host_base_url, joined.token
+                    ))
+                    .json(&serde_json::json!({ "peerId": joined.peer_id }))
+                    .send()
+            });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn prepare_export_directory(
     video_path: String,
@@ -1006,7 +2045,7 @@ fn register_media_source(
         .files
         .write()
         .map_err(|_| "The private media server is unavailable")?
-        .insert(token.clone(), video);
+        .insert(token.clone(), MediaSource::Local(video));
     Ok(MediaRegistration {
         url: format!("{}/media/{token}", state.media.base_url),
         mix_base_url: format!("{}/mix/{token}", state.media.base_url),
@@ -1187,10 +2226,8 @@ fn write_waveform_cache(path: &Path, data: &WaveformData) {
             .unwrap_or("waveform"),
         std::process::id()
     ));
-    if fs::write(&temporary, encoded).is_ok() {
-        if fs::rename(&temporary, path).is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
+    if fs::write(&temporary, encoded).is_ok() && fs::rename(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
     }
 }
 
@@ -1334,7 +2371,7 @@ fn load_video(video_path: String) -> Result<SidecarDocument, String> {
     let imported = fingerprint.as_deref().and_then(|fingerprint| {
         if markdown
             .lines()
-            .any(|line| line.trim() == format!("{EMBEDDED_CHAPTER_MARKER}{fingerprint} -->"))
+            .any(|line| line.trim().starts_with(EMBEDDED_CHAPTER_MARKER))
         {
             return None;
         }
@@ -2956,11 +3993,19 @@ async fn analyze_chunk(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let media = start_media_server().expect("could not start the private media server");
+    let collaboration =
+        start_collaboration_service().expect("could not start local peer collaboration");
     tauri::Builder::default()
-        .manage(AppState::new(media))
+        .manage(AppState::new(media, collaboration))
         .invoke_handler(tauri::generate_handler![
             pick_video,
             pick_export_directory,
+            host_collaboration,
+            join_collaboration,
+            poll_collaboration,
+            publish_collaboration_event,
+            collaboration_status,
+            stop_collaboration,
             prepare_export_directory,
             register_media_source,
             extract_waveform,
@@ -3000,6 +4045,37 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpStream;
+
+    fn collaboration_fixture(folder: &tempfile::TempDir, code: &str) -> HostedSession {
+        let video = folder.path().join("shared.mp4");
+        let sidecar = folder.path().join("shared.md");
+        fs::write(&video, b"0123456789abcdef").expect("shared video fixture");
+        let markdown = initial_markdown(&video);
+        fs::write(&sidecar, &markdown).expect("shared sidecar fixture");
+        HostedSession {
+            code: code.into(),
+            token: Uuid::new_v4().to_string(),
+            service_fullname: format!("FrameNote test {code}.{COLLABORATION_SERVICE_TYPE}"),
+            video_path: video,
+            sidecar_path: sidecar,
+            video_name: "shared.mp4".into(),
+            audio_tracks: Vec::new(),
+            frame_rate: Some(30.0),
+            host_name: "Host".into(),
+            runtime: Arc::new(Mutex::new(HostedSessionRuntime {
+                sequence: 0,
+                document_revision: 0,
+                markdown,
+                transport: CollaborationTransport {
+                    position: 3.5,
+                    playing: false,
+                    playback_rate: 1.0,
+                },
+                events: VecDeque::new(),
+                peers: HashMap::new(),
+            })),
+        }
+    }
 
     #[test]
     fn formats_long_timestamps() {
@@ -3091,6 +4167,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(merge_embedded_chapters(&after_delete, &chapters, "source-one").is_none());
+        assert!(merge_embedded_chapters(&after_delete, &chapters, "changed-source").is_none());
         assert!(open_bookmark_start(
             "- [00:00:12.250] Unnamed 1 <!-- framenote:bookmark:embedded-1-12250 start=12.250 source=embedded-chapter -->"
         )
@@ -3398,7 +4475,7 @@ mod tests {
             .files
             .write()
             .expect("media registry")
-            .insert("mix-test".into(), fixture);
+            .insert("mix-test".into(), MediaSource::Local(fixture));
         let address = server
             .base_url
             .strip_prefix("http://")
@@ -3422,6 +4499,155 @@ mod tests {
         assert!(response
             .windows(2)
             .any(|window| window[0] == 0xff && window[1] & 0xf6 == 0xf0));
+    }
+
+    #[test]
+    fn peer_protocol_joins_streams_ranges_and_syncs_markdown_and_transport() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let service = start_collaboration_service().expect("peer service");
+        let session = collaboration_fixture(&folder, "420731");
+        *service.hosted.write().expect("hosted session") = Some(session.clone());
+        let base_url = format!("http://127.0.0.1:{}", service.port);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("peer client");
+
+        let joined = client
+            .post(format!("{base_url}/join"))
+            .json(&serde_json::json!({
+                "code": "420731",
+                "peerId": "guest-one",
+                "displayName": "Editor One"
+            }))
+            .send()
+            .expect("join peer")
+            .error_for_status()
+            .expect("accepted join")
+            .json::<NetworkJoinResponse>()
+            .expect("join response");
+        assert_eq!(joined.video_name, "shared.mp4");
+        assert_eq!(joined.playback_position, 3.5);
+
+        let media = client
+            .get(format!("{base_url}/session/{}/media", session.token))
+            .header("Range", "bytes=4-8")
+            .send()
+            .expect("peer media range");
+        assert_eq!(media.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(media.bytes().expect("peer media body").as_ref(), b"45678");
+
+        client
+            .post(format!("{base_url}/session/{}/event", session.token))
+            .json(&serde_json::json!({
+                "peerId": "guest-one",
+                "kind": "transport",
+                "payload": { "position": 8.25, "playing": true, "playbackRate": 1.25 }
+            }))
+            .send()
+            .expect("publish transport")
+            .error_for_status()
+            .expect("accepted transport");
+
+        let shared_markdown = format!(
+            "{}\n- [00:00:08.250] Shared mark <!-- framenote:bookmark:shared start=8.250 -->\n",
+            joined.markdown.trim_end()
+        );
+        client
+            .post(format!("{base_url}/session/{}/event", session.token))
+            .json(&serde_json::json!({
+                "peerId": "guest-one",
+                "kind": "document",
+                "payload": { "markdown": shared_markdown }
+            }))
+            .send()
+            .expect("publish markdown")
+            .error_for_status()
+            .expect("accepted markdown");
+
+        let poll = client
+            .get(format!(
+                "{base_url}/session/{}/events?after=0&peerId=guest-one",
+                session.token
+            ))
+            .send()
+            .expect("poll peer")
+            .error_for_status()
+            .expect("accepted poll")
+            .json::<CollaborationPollResult>()
+            .expect("poll response");
+        assert_eq!(poll.participant_count, 2);
+        assert_eq!(poll.events.len(), 2);
+        assert_eq!(poll.events[0].kind, "transport");
+        assert_eq!(poll.events[1].kind, "document");
+        assert!(fs::read_to_string(&session.sidecar_path)
+            .expect("canonical sidecar")
+            .contains("Shared mark"));
+        let runtime = session.runtime.lock().expect("session runtime");
+        assert_eq!(runtime.transport.position, 8.25);
+        assert!(runtime.transport.playing);
+        drop(runtime);
+        let _ = service.mdns.shutdown();
+    }
+
+    #[test]
+    fn six_digit_mdns_discovery_connects_two_app_instances() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let host = start_collaboration_service().expect("host peer service");
+        let guest = start_collaboration_service().expect("guest peer service");
+        let code = six_digit_session_code();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|character| character.is_ascii_digit()));
+        let session = collaboration_fixture(&folder, &code);
+        *host.hosted.write().expect("hosted session") = Some(session.clone());
+
+        let instance_name = format!("FrameNote test {}", Uuid::new_v4());
+        let host_name = format!("framenote-test-{}.local.", &session.token[..8]);
+        let mut properties = HashMap::new();
+        properties.insert("code".to_string(), code.clone());
+        properties.insert("version".to_string(), "1".to_string());
+        let service_info = ServiceInfo::new(
+            COLLABORATION_SERVICE_TYPE,
+            &instance_name,
+            &host_name,
+            "",
+            host.port,
+            properties,
+        )
+        .expect("mDNS service info")
+        .enable_addr_auto();
+        let fullname = service_info.get_fullname().to_string();
+        host.mdns.register(service_info).expect("advertise session");
+
+        let (joined, _) = join_discovered_session(&guest, &code, "Second editor")
+            .expect("discover and join host");
+        assert_eq!(joined.token, session.token);
+        assert_eq!(joined.host_name, "Host");
+        assert_eq!(
+            session
+                .runtime
+                .lock()
+                .expect("session runtime")
+                .peers
+                .get("Second editor")
+                .map(|peer| peer.name.as_str()),
+            None,
+            "peer IDs are generated by each app, not display names"
+        );
+        assert_eq!(
+            session
+                .runtime
+                .lock()
+                .expect("session runtime")
+                .peers
+                .values()
+                .next()
+                .map(|peer| peer.name.as_str()),
+            Some("Second editor")
+        );
+        let _ = host.mdns.unregister(&fullname);
+        let _ = host.mdns.shutdown();
+        let _ = guest.mdns.shutdown();
     }
 
     #[test]
@@ -3551,7 +4777,7 @@ mod tests {
             .files
             .write()
             .expect("media map")
-            .insert("test-token".into(), video);
+            .insert("test-token".into(), MediaSource::Local(video));
         let address = media.base_url.trim_start_matches("http://");
         let mut stream = TcpStream::connect(address).expect("connect media server");
         stream

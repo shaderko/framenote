@@ -8,6 +8,7 @@ import {
   Cloud,
   Clock3,
   Code2,
+  Copy,
   Download,
   FileText,
   Film,
@@ -27,11 +28,15 @@ import {
   Save,
   Scissors,
   Settings2,
+  Share2,
   Sparkles,
   Square,
   Trash2,
+  Users,
   Volume2,
   VolumeX,
+  Wifi,
+  WifiOff,
   X,
   ZoomIn,
   ZoomOut,
@@ -71,6 +76,44 @@ interface MediaRegistration {
   mixBaseUrl: string;
   audioTracks: AudioTrackInfo[];
   frameRate?: number;
+}
+
+interface CollaborationSession {
+  mode: "host" | "guest";
+  code: string;
+  participantCount: number;
+  videoName: string;
+  displayName: string;
+  clientId: string;
+  participants: string[];
+}
+
+interface JoinCollaborationResult {
+  document: SidecarDocument;
+  mediaRegistration: MediaRegistration;
+  session: CollaborationSession;
+  transport: CollaborationTransport;
+}
+
+interface CollaborationTransport {
+  position: number;
+  playing: boolean;
+  playbackRate: number;
+  emittedAt?: number;
+}
+
+interface CollaborationEvent {
+  sequence: number;
+  senderId: string;
+  kind: "transport" | "document";
+  payload: Record<string, unknown>;
+}
+
+interface CollaborationPollResult {
+  events: CollaborationEvent[];
+  participantCount: number;
+  participants: string[];
+  connected: boolean;
 }
 
 interface PrecisionSeekAnchor {
@@ -297,6 +340,10 @@ function App() {
   const credentialStoredValueRef = useRef("");
   const credentialOperationRef = useRef(0);
   const credentialSaveTimerRef = useRef<number | null>(null);
+  const remoteTransportUntilRef = useRef(0);
+  const lastSharedMarkdownRef = useRef("");
+  const collaborationPollFailuresRef = useRef(0);
+  const initialRemotePlayingRef = useRef(false);
 
   const [document, setDocument] = useState<SidecarDocument | null>(() =>
     IS_DEMO
@@ -366,6 +413,11 @@ function App() {
   const [waveformSelection, setWaveformSelection] = useState<WaveformSelection | null>(null);
   const [subtitleTimingOverride, setSubtitleTimingOverride] = useState<SubtitleTimingOverride | null>(null);
   const [timelineCollapsed, setTimelineCollapsed] = useState(false);
+  const [collaboration, setCollaboration] = useState<CollaborationSession | null>(null);
+  const [collaborationOpen, setCollaborationOpen] = useState(false);
+  const [collaborationPhase, setCollaborationPhase] = useState<"idle" | "hosting" | "joining" | "connected" | "reconnecting">("idle");
+  const [joinCode, setJoinCode] = useState("");
+  const [displayName, setDisplayName] = useState(() => localStorage.getItem("framenote:display-name") || "Editor");
 
   const selectedAudioTracks = useMemo(
     () => mediaRegistration?.audioTracks.filter((track) => trackLevels[track.streamIndex] !== undefined) ?? [],
@@ -454,6 +506,11 @@ function App() {
 
   useEffect(() => {
     if (!document || !IS_TAURI) return;
+    if (collaboration?.mode === "guest") {
+      setWaveform(null);
+      setWaveformPhase("idle");
+      return;
+    }
     let current = true;
     setWaveform(null);
     setWaveformPhase("loading");
@@ -471,7 +528,7 @@ function App() {
     return () => {
       current = false;
     };
-  }, [document?.videoPath]);
+  }, [collaboration?.mode, document?.videoPath]);
 
   useEffect(() => () => {
     if (frameSeekTimerRef.current) window.clearTimeout(frameSeekTimerRef.current);
@@ -626,7 +683,17 @@ function App() {
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = playbackRate;
     if (mixAudioRef.current) mixAudioRef.current.playbackRate = playbackRate;
-  }, [playbackRate]);
+    if (collaboration && videoRef.current && Date.now() >= remoteTransportUntilRef.current) {
+      void invoke("publish_collaboration_event", {
+        kind: "transport",
+        payload: {
+          position: videoRef.current.currentTime,
+          playing: !videoRef.current.paused,
+          playbackRate,
+        },
+      }).catch(() => undefined);
+    }
+  }, [collaboration?.code, collaboration?.mode, playbackRate]);
 
   const persistPlaybackPosition = useCallback(async (position = currentTimeRef.current) => {
     const currentDocument = documentRef.current;
@@ -657,6 +724,7 @@ function App() {
         await Promise.all([
           persistPlaybackPosition(),
           persistApiKey(config.provider, config.apiKey),
+          invoke("stop_collaboration").catch(() => undefined),
         ]);
       } finally {
         await appWindow.destroy();
@@ -720,6 +788,11 @@ function App() {
     }
     setOpening(true);
     try {
+      if (collaboration) {
+        await invoke("stop_collaboration").catch(() => undefined);
+        setCollaboration(null);
+        setCollaborationPhase("idle");
+      }
       await persistPlaybackPosition().catch(() => undefined);
       const next = await invoke<SidecarDocument>("load_video", { videoPath: path });
       const registration = await invoke<MediaRegistration>("register_media_source", { videoPath: next.videoPath });
@@ -760,7 +833,7 @@ function App() {
     } finally {
       setOpening(false);
     }
-  }, [applyDocument, checkOllama, exportPhase, persistPlaybackPosition, recordRecentProject, showNotice, stopMix]);
+  }, [applyDocument, checkOllama, collaboration, exportPhase, persistPlaybackPosition, recordRecentProject, showNotice, stopMix]);
 
   const openVideo = useCallback(async () => {
     if (exportPhase === "running") {
@@ -781,6 +854,217 @@ function App() {
       setOpening(false);
     }
   }, [exportPhase, loadVideoPath, showNotice]);
+
+  const startSharing = useCallback(async () => {
+    if (!document || !IS_TAURI) {
+      showNotice("Open a local video before creating a session.", "error");
+      return;
+    }
+    setCollaborationPhase("hosting");
+    localStorage.setItem("framenote:display-name", displayName.trim() || "Host");
+    try {
+      const session = await invoke<CollaborationSession>("host_collaboration", {
+        videoPath: document.videoPath,
+        displayName,
+      });
+      lastSharedMarkdownRef.current = document.markdown;
+      collaborationPollFailuresRef.current = 0;
+      setCollaboration(session);
+      setCollaborationPhase("connected");
+      showNotice(`Session ${session.code} is live on this local network.`);
+    } catch (error) {
+      setCollaborationPhase("idle");
+      showNotice(errorMessage(error), "error");
+    }
+  }, [displayName, document, showNotice]);
+
+  const joinSharing = useCallback(async () => {
+    if (!IS_TAURI) return;
+    const normalizedCode = joinCode.replace(/\D/g, "").slice(0, 6);
+    if (normalizedCode.length !== 6) {
+      showNotice("Enter the six-digit session code.", "error");
+      return;
+    }
+    setCollaborationPhase("joining");
+    localStorage.setItem("framenote:display-name", displayName.trim() || "Guest");
+    try {
+      await persistPlaybackPosition().catch(() => undefined);
+      const result = await invoke<JoinCollaborationResult>("join_collaboration", {
+        code: normalizedCode,
+        displayName,
+      });
+      stopMix();
+      applyDocument(result.document);
+      setMediaRegistration(result.mediaRegistration);
+      setVideoUrl(result.mediaRegistration.url);
+      setTrackLevels(result.mediaRegistration.audioTracks[0]
+        ? { [result.mediaRegistration.audioTracks[0].streamIndex]: 1 }
+        : {});
+      setMixerActive(false);
+      setMixerOpen(false);
+      setWaveformOpen(false);
+      setWaveformSelection(null);
+      setWaveform(null);
+      setWaveformPhase("idle");
+      setEditingId(null);
+      setSubtitleTimingOverride(null);
+      setAnalysisOpen(false);
+      setExportOpen(false);
+      setSettingsOpen(false);
+      setRawMode(false);
+      setDuration(0);
+      setPlaybackRate(result.transport.playbackRate);
+      setCurrentTime(result.transport.position);
+      currentTimeRef.current = result.transport.position;
+      resumePositionRef.current = result.transport.position;
+      initialRemotePlayingRef.current = result.transport.playing;
+      setIsPlaying(false);
+      lastSharedMarkdownRef.current = result.document.markdown;
+      collaborationPollFailuresRef.current = 0;
+      setCollaboration(result.session);
+      setCollaborationPhase("connected");
+      showNotice(`Joined ${result.document.videoName} · playback and notes are live.`);
+    } catch (error) {
+      setCollaborationPhase("idle");
+      showNotice(errorMessage(error), "error");
+    }
+  }, [applyDocument, displayName, joinCode, persistPlaybackPosition, showNotice, stopMix]);
+
+  const stopSharing = useCallback(async () => {
+    const wasGuest = collaboration?.mode === "guest";
+    try {
+      if (IS_TAURI) await invoke("stop_collaboration");
+    } finally {
+      setCollaboration(null);
+      setCollaborationPhase("idle");
+      setCollaborationOpen(false);
+      collaborationPollFailuresRef.current = 0;
+      if (wasGuest) {
+        stopMix();
+        setDocument(null);
+        setVideoUrl(null);
+        setMediaRegistration(null);
+        setIsPlaying(false);
+        setCurrentTime(0);
+        currentTimeRef.current = 0;
+      }
+    }
+  }, [collaboration?.mode, stopMix]);
+
+  const copySessionCode = useCallback(async () => {
+    if (!collaboration) return;
+    try {
+      await navigator.clipboard.writeText(collaboration.code);
+      showNotice("Session code copied.");
+    } catch {
+      showNotice(`Session code: ${collaboration.code}`);
+    }
+  }, [collaboration, showNotice]);
+
+  const publishTransport = useCallback((transport?: Partial<CollaborationTransport>) => {
+    const video = videoRef.current;
+    if (!collaboration || !video || Date.now() < remoteTransportUntilRef.current) return;
+    const payload: CollaborationTransport = {
+      position: Math.max(0, transport?.position ?? video.currentTime),
+      playing: transport?.playing ?? !video.paused,
+      playbackRate: transport?.playbackRate ?? video.playbackRate,
+      emittedAt: Date.now(),
+    };
+    void invoke("publish_collaboration_event", { kind: "transport", payload })
+      .catch(() => setCollaborationPhase("reconnecting"));
+  }, [collaboration]);
+
+  useEffect(() => {
+    if (!collaboration || !document || !IS_TAURI) return;
+    if (document.markdown === lastSharedMarkdownRef.current) return;
+    const markdown = document.markdown;
+    lastSharedMarkdownRef.current = markdown;
+    const timer = window.setTimeout(() => {
+      void invoke("publish_collaboration_event", {
+        kind: "document",
+        payload: { markdown },
+      }).catch((error) => {
+        if (lastSharedMarkdownRef.current === markdown) lastSharedMarkdownRef.current = "";
+        setCollaborationPhase("reconnecting");
+        showNotice(errorMessage(error), "error");
+      });
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [collaboration, document, showNotice]);
+
+  useEffect(() => {
+    if (!collaboration || !IS_TAURI) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const result = await invoke<CollaborationPollResult>("poll_collaboration");
+        if (cancelled) return;
+        collaborationPollFailuresRef.current = 0;
+        setCollaborationPhase("connected");
+        setCollaboration((current) => current ? {
+          ...current,
+          participantCount: result.participantCount,
+          participants: result.participants,
+        } : current);
+        for (const event of result.events) {
+          if (event.senderId === collaboration.clientId) continue;
+          if (event.kind === "document") {
+            const markdown = typeof event.payload.markdown === "string" ? event.payload.markdown : null;
+            const current = documentRef.current;
+            if (markdown !== null && current && markdown !== current.markdown) {
+              lastSharedMarkdownRef.current = markdown;
+              applyDocument({ ...current, markdown });
+            }
+            continue;
+          }
+          if (event.kind === "transport") {
+            const rawPosition = Number(event.payload.position);
+            const playbackRate = Number(event.payload.playbackRate);
+            const playing = event.payload.playing === true;
+            const emittedAt = Number(event.payload.emittedAt);
+            const video = videoRef.current;
+            if (!video || !Number.isFinite(rawPosition) || !Number.isFinite(playbackRate)) continue;
+            const transitSeconds = playing && Number.isFinite(emittedAt)
+              ? Math.max(0, Math.min(5, (Date.now() - emittedAt) / 1_000))
+              : 0;
+            const position = rawPosition + transitSeconds * playbackRate;
+            remoteTransportUntilRef.current = Date.now() + 1_200;
+            setPlaybackRate(playbackRate);
+            video.playbackRate = playbackRate;
+            if (Math.abs(video.currentTime - position) > 0.18) {
+              video.currentTime = Math.max(0, Math.min(video.duration || Number.POSITIVE_INFINITY, position));
+              currentTimeRef.current = video.currentTime;
+              setCurrentTime(video.currentTime);
+            }
+            if (playing && video.paused) {
+              void video.play().catch(() => showNotice("Click the player once to allow synchronized playback.", "error"));
+            } else if (!playing && !video.paused) {
+              video.pause();
+            }
+          }
+        }
+      } catch (error) {
+        if (cancelled) return;
+        collaborationPollFailuresRef.current += 1;
+        setCollaborationPhase("reconnecting");
+        if (collaborationPollFailuresRef.current === 3) showNotice(errorMessage(error), "error");
+      } finally {
+        if (!cancelled) timer = window.setTimeout(poll, 280);
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [applyDocument, collaboration?.clientId, collaboration?.mode, collaboration?.code, showNotice]);
+
+  useEffect(() => {
+    if (collaboration?.mode !== "host" || !isPlaying) return;
+    const timer = window.setInterval(() => publishTransport({ playing: true }), 2_000);
+    return () => window.clearInterval(timer);
+  }, [collaboration?.mode, isPlaying, publishTransport]);
 
   const reloadMarkdown = useCallback(async (quiet = false) => {
     if (!IS_TAURI || !document || rawDirty) return;
@@ -892,6 +1176,11 @@ function App() {
       updateRecentPlayback(documentRef.current.videoPath, resumeAt, video.duration);
     }
     resumePositionRef.current = 0;
+    if (initialRemotePlayingRef.current) {
+      initialRemotePlayingRef.current = false;
+      remoteTransportUntilRef.current = Date.now() + 1_200;
+      void video.play().catch(() => showNotice("Click the player once to allow synchronized playback.", "error"));
+    }
   }, [showNotice, updateRecentPlayback]);
 
   const handleTimeUpdate = useCallback((video: HTMLVideoElement) => {
@@ -908,13 +1197,15 @@ function App() {
   const handleVideoPlay = useCallback((video: HTMLVideoElement) => {
     setIsPlaying(true);
     if (mixerActive) startMixAt(video.currentTime);
-  }, [mixerActive, startMixAt]);
+    publishTransport({ position: video.currentTime, playing: true });
+  }, [mixerActive, publishTransport, startMixAt]);
 
   const handleVideoPause = useCallback((video: HTMLVideoElement) => {
     setIsPlaying(false);
     mixAudioRef.current?.pause();
     void persistPlaybackPosition(video.currentTime).catch(() => undefined);
-  }, [persistPlaybackPosition]);
+    publishTransport({ position: video.currentTime, playing: false });
+  }, [persistPlaybackPosition, publishTransport]);
 
   const handleVideoEnded = useCallback(() => {
     setIsPlaying(false);
@@ -926,7 +1217,8 @@ function App() {
   const handleSeeked = useCallback((video: HTMLVideoElement) => {
     currentTimeRef.current = video.currentTime;
     if (mixerActive && !video.paused) startMixAt(video.currentTime);
-  }, [mixerActive, startMixAt]);
+    publishTransport({ position: video.currentTime, playing: !video.paused });
+  }, [mixerActive, publishTransport, startMixAt]);
 
   const addBookmark = useCallback(async () => {
     if (!document || !IS_TAURI) {
@@ -1457,7 +1749,10 @@ function App() {
       <main className="empty-shell">
         <header className="app-header empty-header">
           <Brand />
-          <div className="privacy-note"><span className="status-dot" /> Local files stay local</div>
+          <div className="empty-header-actions">
+            <div className="privacy-note"><span className="status-dot" /> Local files stay local</div>
+            <button className="session-button" onClick={() => setCollaborationOpen(true)}><Users size={14} /> Join session</button>
+          </div>
         </header>
         <section className={`empty-state ${recentProjects.length ? "with-recents" : ""}`}>
           <div className="empty-intro">
@@ -1476,6 +1771,7 @@ function App() {
               {opening ? <RefreshCw className="spin" size={18} /> : <FolderOpen size={18} />}
               {opening ? "Opening…" : "Open a video"}
             </button>
+            <button className="empty-join" onClick={() => setCollaborationOpen(true)}><Share2 size={14} /> Join a peer with a code</button>
             <div className="shortcut-hint"><kbd>N</kbd> starts a mark <kbd>M</kbd> ends it</div>
           </div>
           {recentProjects.length > 0 && (
@@ -1521,6 +1817,22 @@ function App() {
           )}
         </section>
         <footer className="empty-footer"><span>Sidecars use the video filename</span><span>recording.mp4 <b>→</b> recording.md</span></footer>
+        {collaborationOpen && (
+          <CollaborationDialog
+            session={collaboration}
+            phase={collaborationPhase}
+            canHost={false}
+            code={joinCode}
+            displayName={displayName}
+            onCode={setJoinCode}
+            onDisplayName={setDisplayName}
+            onHost={() => void startSharing()}
+            onJoin={() => void joinSharing()}
+            onCopy={() => void copySessionCode()}
+            onStop={() => void stopSharing()}
+            onClose={() => setCollaborationOpen(false)}
+          />
+        )}
         {notice && <Notice notice={notice} onClose={() => setNotice(null)} />}
       </main>
     );
@@ -1532,15 +1844,21 @@ function App() {
         <Brand />
         <div className="file-identity">
           <strong>{document.videoName}</strong>
-          <span title={document.sidecarPath}><Check size={12} /> {document.sidecarPath.split(/[\\/]/).at(-1)} saved</span>
+          <span title={document.sidecarPath}>{collaboration ? <Users size={12} /> : <Check size={12} />} {collaboration ? `${collaboration.mode === "host" ? "Hosting" : "Joined"} · ${collaboration.participantCount} live` : `${document.sidecarPath.split(/[\\/]/).at(-1)} saved`}</span>
         </div>
         <div className="header-actions">
           <button className="quiet-button" onClick={() => void openVideo()}><FolderOpen size={16} /> Open</button>
+          <button className={`session-button ${collaboration ? "live" : ""} ${collaborationPhase === "reconnecting" ? "reconnecting" : ""}`} onClick={() => setCollaborationOpen(true)} aria-label={collaboration ? `Shared session ${collaboration.code}, ${collaboration.participantCount} participants` : "Share this project"}>
+            {collaborationPhase === "reconnecting" ? <WifiOff size={14} /> : collaboration ? <Wifi size={14} /> : <Share2 size={14} />}
+            <span>{collaboration ? `${collaboration.participantCount} live` : "Share"}</span>
+          </button>
           <div className="header-export">
             <button
               className={`export-button header-export-button ${exportOpen ? "selected" : ""} ${exportPhase === "running" ? "running" : ""}`}
               aria-expanded={exportOpen}
               aria-label={`Export ${completedMarks.length} completed marks`}
+              title={collaboration?.mode === "guest" ? "Export is available on the host computer" : "Export completed marks"}
+              disabled={collaboration?.mode === "guest"}
               onClick={toggleExportMenu}
             >
               {exportPhase === "running" ? <RefreshCw className="spin" size={14} /> : <Scissors size={15} />}
@@ -1629,7 +1947,7 @@ function App() {
               }}
             />
             <div className="stage-topline">
-              <span>LOCAL PLAYBACK</span>
+              <span>{collaboration ? `LIVE ${collaboration.mode === "host" ? "HOST" : "PEER"} · ${collaboration.code}` : "LOCAL PLAYBACK"}</span>
               <span>{document.videoName.split(".").at(-1)?.toUpperCase()} · {duration ? formatTime(duration, true) : "Loading…"}</span>
             </div>
             {activeSubtitles.length > 0 && (
@@ -1784,6 +2102,7 @@ function App() {
                     aria-expanded={analysisOpen}
                     aria-label={analysisPhase === "running" ? `Analysis ${analysisCursor} of ${analysisTotal}` : "Analyze from current frame"}
                     title={analysisPhase === "running" ? `Analyzing ${analysisCursor} of ${analysisTotal}` : "Analyze from current frame"}
+                    disabled={collaboration?.mode === "guest"}
                     onClick={toggleAnalysisMenu}
                   >
                     {analysisPhase === "running" ? <RefreshCw className="spin" size={14} /> : <Sparkles size={14} />}
@@ -1801,7 +2120,8 @@ function App() {
                   <button
                     className={`control-icon waveform-trigger ${waveformOpen ? "selected" : ""}`}
                     aria-label={waveformOpen ? "Hide waveform editor" : "Show waveform editor"}
-                    title={waveformOpen ? "Hide waveform editor" : "Show waveform editor"}
+                    title={collaboration?.mode === "guest" ? "Waveform extraction runs on the host computer" : waveformOpen ? "Hide waveform editor" : "Show waveform editor"}
+                    disabled={collaboration?.mode === "guest"}
                     onClick={toggleWaveform}
                   >
                     <AudioWaveform size={18} />
@@ -1945,6 +2265,22 @@ function App() {
           )}
         </aside>
       </div>
+      {collaborationOpen && (
+        <CollaborationDialog
+          session={collaboration}
+          phase={collaborationPhase}
+          canHost={true}
+          code={joinCode}
+          displayName={displayName}
+          onCode={setJoinCode}
+          onDisplayName={setDisplayName}
+          onHost={() => void startSharing()}
+          onJoin={() => void joinSharing()}
+          onCopy={() => void copySessionCode()}
+          onStop={() => void stopSharing()}
+          onClose={() => setCollaborationOpen(false)}
+        />
+      )}
       {notice && <Notice notice={notice} onClose={() => setNotice(null)} />}
     </main>
   );
@@ -2374,6 +2710,102 @@ function Notice({ notice, onClose }: { notice: { tone: "info" | "error"; text: s
       {notice.tone === "error" ? <CircleAlert size={17} /> : <Check size={17} />}
       <span>{notice.text}</span>
       <button aria-label="Dismiss" onClick={onClose}><X size={15} /></button>
+    </div>
+  );
+}
+
+function CollaborationDialog({
+  session,
+  phase,
+  canHost,
+  code,
+  displayName,
+  onCode,
+  onDisplayName,
+  onHost,
+  onJoin,
+  onCopy,
+  onStop,
+  onClose,
+}: {
+  session: CollaborationSession | null;
+  phase: "idle" | "hosting" | "joining" | "connected" | "reconnecting";
+  canHost: boolean;
+  code: string;
+  displayName: string;
+  onCode: (code: string) => void;
+  onDisplayName: (name: string) => void;
+  onHost: () => void;
+  onJoin: () => void;
+  onCopy: () => void;
+  onStop: () => void;
+  onClose: () => void;
+}) {
+  const busy = phase === "hosting" || phase === "joining";
+  return (
+    <div className="session-layer" role="presentation">
+      <button className="session-scrim" aria-label="Close sharing dialog" onClick={onClose} />
+      <section className="session-dialog" role="dialog" aria-modal="true" aria-labelledby="session-title">
+        <header>
+          <div>
+            <p className="eyebrow">PEER SESSION</p>
+            <h2 id="session-title">{session ? "Watching together" : "Share without uploading"}</h2>
+          </div>
+          <button className="icon-button" aria-label="Close sharing dialog" onClick={onClose}><X size={16} /></button>
+        </header>
+        {session ? (
+          <div className="session-connected">
+            <div className={`session-network-state ${phase}`}>
+              {phase === "reconnecting" ? <WifiOff size={17} /> : <Wifi size={17} />}
+              <div><strong>{phase === "reconnecting" ? "Reconnecting on local network" : session.mode === "host" ? "Session is discoverable" : "Connected directly to host"}</strong><span>{session.videoName}</span></div>
+            </div>
+            <button className="session-code" onClick={onCopy} aria-label={`Copy session code ${session.code}`}>
+              <span>Six-digit code</span>
+              <strong>{session.code.slice(0, 3)}&nbsp;{session.code.slice(3)}</strong>
+              <Copy size={15} />
+            </button>
+            <div className="session-presence">
+              <div><Users size={15} /><strong>{session.participantCount} watching</strong></div>
+              <ul>{session.participants.map((name, index) => <li key={`${name}-${index}`}><i />{name}</li>)}</ul>
+            </div>
+            <p className="session-footnote">Playback, seeking, marks, subtitles, and Markdown changes synchronize directly between FrameNote peers. The host keeps the canonical sidecar and serves the original video read-only.</p>
+            <button className="secondary full session-stop" onClick={onStop}>{session.mode === "host" ? "End session" : "Leave session"}</button>
+          </div>
+        ) : (
+          <div className="session-setup">
+            <label className="session-name">
+              <span>Your name</span>
+              <input value={displayName} maxLength={48} autoComplete="name" onChange={(event) => onDisplayName(event.target.value)} placeholder="Editor" />
+            </label>
+            {canHost && (
+              <div className="session-path host-path">
+                <div><Share2 size={17} /><span><strong>Create session</strong><small>Share this video and its timeline from this computer.</small></span></div>
+                <button className="primary compact" disabled={busy} onClick={onHost}>{phase === "hosting" ? <RefreshCw className="spin" size={14} /> : <Wifi size={14} />}{phase === "hosting" ? "Starting…" : "Create"}</button>
+              </div>
+            )}
+            <div className="session-divider"><span>JOIN WITH CODE</span></div>
+            <div className="session-path join-path">
+              <label>
+                <span>Session code</span>
+                <input
+                  className="session-code-input"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  maxLength={6}
+                  autoFocus={!canHost}
+                  value={code}
+                  onChange={(event) => onCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                  onKeyDown={(event) => { if (event.key === "Enter" && code.length === 6) onJoin(); }}
+                  placeholder="000000"
+                  aria-label="Six-digit session code"
+                />
+              </label>
+              <button className="secondary" disabled={busy || code.length !== 6} onClick={onJoin}>{phase === "joining" ? <RefreshCw className="spin" size={14} /> : <Users size={14} />}{phase === "joining" ? "Finding…" : "Join"}</button>
+            </div>
+            <p className="session-footnote">Both computers must be on the same local network. The code finds the host through peer discovery; no account, cloud upload, or central FrameNote server is used.</p>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

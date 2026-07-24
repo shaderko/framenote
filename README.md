@@ -10,6 +10,7 @@ Open `recording.mp4` and FrameNote creates or reads `recording.md` in the same f
 - Adjacent Markdown sidecars with no video copying or mutation
 - `N` to start an editable mark and `M` to end the nearest preceding open mark
 - One-time import of OBS Hybrid MP4/MOV chapter markers as editable point bookmarks
+- Direct local-network watch sessions with six-digit discovery codes, host-served video, shared playback, marks, subtitles, and Markdown
 - Clickable bookmarks and AI entries that seek the video
 - Raw Markdown editor plus automatic reload when the app regains focus
 - Playback shortcuts: Space, Left/Right (10 seconds), F, N (start mark), and M (end mark)
@@ -56,6 +57,14 @@ npm run tauri:dev
 
 Web-only UI development is also available with `npm run dev`, but native file selection, sidecar writes, and analysis require Tauri.
 
+## Watch together on the local network
+
+Open a project and choose **Share → Create**. FrameNote advertises a random six-digit code only on the current local network. Other FrameNote instances choose **Join session**, enter that code, and stream the original video directly from the host with HTTP byte-range seeking. Play, pause, seek, playback rate, marks, subtitles, AI entries, and raw Markdown updates propagate in both directions; the host remains the owner of the canonical adjacent sidecar.
+
+There is no FrameNote account, cloud upload, external signaling service, or central relay. The host app is the direct peer and must remain open. This serverless discovery model is intentionally LAN-only: peers must be on the same Wi-Fi/Ethernet network, multicast DNS must be allowed, and guest access ends when the host ends the session. Internet sharing across routers would require a signaling and usually TURN relay service, which this local-first mode does not use.
+
+On macOS, allow FrameNote's Local Network permission when prompted. On Windows, allow FrameNote on private networks if Windows Defender Firewall prompts; public-network access is not needed. AI analysis, waveform extraction, and rough-cut export run on the host because the original file never gets copied to guests; their resulting sidecar entries appear for every peer.
+
 ## Verify and package
 
 ```sh
@@ -66,6 +75,8 @@ npm run tauri:build
 ```
 
 Native bundles are written under `src-tauri/target/release/bundle/`.
+
+The included `.github/workflows/build-desktop.yml` produces Apple Silicon and Intel macOS DMGs plus a Windows x64 MSI/NSIS installer when manually dispatched or when a `v*` tag is pushed. It is also the repeatable cross-platform packaging check for machines not available locally.
 
 ## Sidecar format
 
@@ -88,7 +99,7 @@ FrameNote initializes a deliberately small Markdown structure:
 
 The HTML comments carry stable IDs, exact ranges, and the latest playback position. They stay invisible in rendered Markdown and remain human-editable. Timeline markers are optional: human-authored `- [MM:SS] text` and `- [HH:MM:SS–HH:MM:SS] text` entries still render. Unknown headings, paragraphs, and Markdown are preserved. If you remove a FrameNote marker, edit that entry through the raw Markdown view.
 
-On the first successful open of an MP4/MOV source, FrameNote asks FFprobe for embedded chapter markers such as those written by OBS Hybrid MP4. It adds each chapter as a named point bookmark and writes a hidden source fingerprint as an import receipt. The receipt prevents later opens from recreating markers you deliberately deleted; replacing or modifying the source video permits a fresh import without duplicating bookmarks already at the same timestamp.
+On the first successful open of an MP4/MOV source, FrameNote asks FFprobe for embedded chapter markers such as those written by OBS Hybrid MP4. It adds each chapter as a named point bookmark and writes a hidden import receipt to the sidecar. That receipt prevents every later open from recreating markers you deliberately deleted, even if the source video changes. Removing the sidecar itself starts a new project and allows the one-time import again.
 
 ## Analysis behavior and privacy
 

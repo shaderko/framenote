@@ -480,6 +480,11 @@ fn requested_range(request: &Request, size: u64) -> Option<(u64, u64)> {
     (start < size && start <= end).then_some((start, end))
 }
 
+/// Maximum bytes to serve in a single video chunk. The browser will make
+/// additional range requests for the rest — each chunk stays small enough
+/// to tunnel through the relay without timeouts or memory issues.
+const MAX_VIDEO_CHUNK: u64 = 2 * 1024 * 1024; // 2 MiB
+
 fn respond_local_media(request: Request, path: &Path) {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let _ = request.respond(Response::empty(StatusCode(405)));
@@ -499,10 +504,16 @@ fn respond_local_media(request: Request, path: &Path) {
         return;
     }
     let range = requested_range(&request, size);
-    let (start, end, status) = match range {
+    let (start, mut end, status) = match range {
         Some((start, end)) => (start, end, StatusCode(206)),
         None => (0, size - 1, StatusCode(200)),
     };
+    // Cap each chunk to MAX_VIDEO_CHUNK so that even a "bytes=0-" (entire
+    // file) request doesn't send the whole video in one shot. The browser
+    // will see the Content-Range header and request the next chunk.
+    if end - start + 1 > MAX_VIDEO_CHUNK {
+        end = start + MAX_VIDEO_CHUNK - 1;
+    }
     let length = end - start + 1;
     let mut headers = vec![
         header("Accept-Ranges", "bytes"),

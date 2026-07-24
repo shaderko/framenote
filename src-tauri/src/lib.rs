@@ -91,6 +91,20 @@ struct CachedRemoteMediaSource {
     prefetching: Arc<AtomicBool>,
 }
 
+enum RemoteMediaSourceConfig {
+    Hls {
+        stream_base_url: String,
+        mix_url: String,
+        cache_dir: PathBuf,
+    },
+    Cached {
+        media_url: String,
+        mix_url: String,
+        content_type: String,
+        cache_path: PathBuf,
+    },
+}
+
 #[derive(Default)]
 struct RemoteMediaCacheState {
     total_size: Option<u64>,
@@ -767,6 +781,48 @@ fn remote_media_client() -> Result<reqwest::blocking::Client, String> {
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|error| format!("Could not prepare the shared media connection: {error}"))
+}
+
+// Reqwest's blocking client must be built outside an async-runtime worker.
+fn install_remote_media_source(
+    files: &RwLock<HashMap<String, MediaSource>>,
+    token: String,
+    config: RemoteMediaSourceConfig,
+) -> Result<(), String> {
+    let client = remote_media_client()?;
+    let source = match config {
+        RemoteMediaSourceConfig::Hls {
+            stream_base_url,
+            mix_url,
+            cache_dir,
+        } => MediaSource::RemoteHls(RemoteHlsSource {
+            stream_base_url,
+            mix_url,
+            cache_dir,
+            client,
+            fetch_lock: Default::default(),
+        }),
+        RemoteMediaSourceConfig::Cached {
+            media_url,
+            mix_url,
+            content_type,
+            cache_path,
+        } => MediaSource::CachedRemote(CachedRemoteMediaSource {
+            media_url,
+            mix_url,
+            content_type,
+            cache_path,
+            cache_state: Default::default(),
+            fetch_lock: Default::default(),
+            client,
+            prefetching: Default::default(),
+        }),
+    };
+    files
+        .write()
+        .map_err(|_| "The private media server is unavailable.".to_string())?
+        .insert(token, source);
+    Ok(())
 }
 
 fn ensure_remote_media_size(source: &CachedRemoteMediaSource) -> Result<u64, String> {
@@ -3252,31 +3308,26 @@ async fn join_collaboration(
         format!("{}/media/{media_token}", state.media.base_url)
     };
     let media_source = if stream_kind == "hls" {
-        MediaSource::RemoteHls(RemoteHlsSource {
+        RemoteMediaSourceConfig::Hls {
             stream_base_url: format!("{host_base_url}/session/{}", network.token),
             mix_url: format!("{host_base_url}/session/{}/mix", network.token),
             cache_dir: segment_cache,
-            client: remote_media_client()?,
-            fetch_lock: Default::default(),
-        })
+        }
     } else {
-        MediaSource::CachedRemote(CachedRemoteMediaSource {
+        RemoteMediaSourceConfig::Cached {
             media_url: format!("{host_base_url}/session/{}/media", network.token),
             mix_url: format!("{host_base_url}/session/{}/mix", network.token),
             content_type: media_content_type(Path::new(&network.video_name)).into(),
             cache_path: shadow_video_path.clone(),
-            cache_state: Default::default(),
-            fetch_lock: Default::default(),
-            client: remote_media_client()?,
-            prefetching: Default::default(),
-        })
+        }
     };
-    state
-        .media
-        .files
-        .write()
-        .map_err(|_| "The private media server is unavailable.".to_string())?
-        .insert(media_token.clone(), media_source);
+    let media_files = Arc::clone(&state.media.files);
+    let source_token = media_token.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        install_remote_media_source(&media_files, source_token, media_source)
+    })
+    .await
+    .map_err(|error| format!("The shared media setup stopped unexpectedly: {error}"))??;
     let joined = JoinedSession {
         code: code.clone(),
         token: network.token.clone(),
@@ -3440,31 +3491,26 @@ async fn join_relay_session(
         format!("{}/media/{media_token}", state.media.base_url)
     };
     let media_source = if stream_kind == "hls" {
-        MediaSource::RemoteHls(RemoteHlsSource {
+        RemoteMediaSourceConfig::Hls {
             stream_base_url: format!("{http_base}/session/{}", network.token),
             mix_url: format!("{http_base}/session/{}/mix", network.token),
             cache_dir: segment_cache,
-            client: remote_media_client()?,
-            fetch_lock: Default::default(),
-        })
+        }
     } else {
-        MediaSource::CachedRemote(CachedRemoteMediaSource {
+        RemoteMediaSourceConfig::Cached {
             media_url: format!("{http_base}/session/{}/media", network.token),
             mix_url: format!("{http_base}/session/{}/mix", network.token),
             content_type: media_content_type(Path::new(&network.video_name)).into(),
             cache_path: shadow_video_path.clone(),
-            cache_state: Default::default(),
-            fetch_lock: Default::default(),
-            client: remote_media_client()?,
-            prefetching: Default::default(),
-        })
+        }
     };
-    state
-        .media
-        .files
-        .write()
-        .map_err(|_| "The private media server is unavailable.".to_string())?
-        .insert(media_token.clone(), media_source);
+    let media_files = Arc::clone(&state.media.files);
+    let source_token = media_token.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        install_remote_media_source(&media_files, source_token, media_source)
+    })
+    .await
+    .map_err(|error| format!("The shared media setup stopped unexpectedly: {error}"))??;
     let joined = JoinedSession {
         code: code.clone(),
         token: network.token.clone(),
@@ -5830,6 +5876,37 @@ mod tests {
         fs::write(&video, b"longer replacement").expect("changed video fixture");
         let second = waveform_cache_key(&video).expect("second cache key");
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn remote_media_client_is_installed_off_the_async_worker() {
+        let files = Arc::new(RwLock::new(HashMap::new()));
+        let install_files = Arc::clone(&files);
+        tokio::task::spawn_blocking(move || {
+            install_remote_media_source(
+                &install_files,
+                "remote".into(),
+                RemoteMediaSourceConfig::Hls {
+                    stream_base_url: "http://127.0.0.1:1/session/test".into(),
+                    mix_url: "http://127.0.0.1:1/session/test/mix".into(),
+                    cache_dir: PathBuf::new(),
+                },
+            )
+        })
+        .await
+        .expect("media setup worker")
+        .expect("remote media source");
+
+        tokio::task::spawn_blocking(move || {
+            let source = files
+                .write()
+                .expect("media registry")
+                .remove("remote")
+                .expect("installed source");
+            assert!(matches!(source, MediaSource::RemoteHls(_)));
+        })
+        .await
+        .expect("media cleanup worker");
     }
 
     #[test]

@@ -9,6 +9,7 @@ Open `recording.mp4` and FrameNote creates or reads `recording.md` in the same f
 - Native local file picker and system-webview video playback through a private byte-range server
 - Adjacent Markdown sidecars with no video copying or mutation
 - `N` to start an editable mark and `M` to end the nearest preceding open mark
+- One-time import of OBS Hybrid MP4/MOV chapter markers as editable point bookmarks
 - Clickable bookmarks and AI entries that seek the video
 - Raw Markdown editor plus automatic reload when the app regains focus
 - Playback shortcuts: Space, Left/Right (10 seconds), F, N (start mark), and M (end mark)
@@ -86,6 +87,8 @@ FrameNote initializes a deliberately small Markdown structure:
 ```
 
 The HTML comments carry stable IDs, exact ranges, and the latest playback position. They stay invisible in rendered Markdown and remain human-editable. Timeline markers are optional: human-authored `- [MM:SS] text` and `- [HH:MM:SS–HH:MM:SS] text` entries still render. Unknown headings, paragraphs, and Markdown are preserved. If you remove a FrameNote marker, edit that entry through the raw Markdown view.
+
+On the first successful open of an MP4/MOV source, FrameNote asks FFprobe for embedded chapter markers such as those written by OBS Hybrid MP4. It adds each chapter as a named point bookmark and writes a hidden source fingerprint as an import receipt. The receipt prevents later opens from recreating markers you deliberately deleted; replacing or modifying the source video permits a fresh import without duplicating bookmarks already at the same timestamp.
 
 ## Analysis behavior and privacy
 

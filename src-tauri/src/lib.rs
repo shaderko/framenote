@@ -3136,7 +3136,7 @@ mod tests {
         let video = folder.path().join("hybrid-marker-fixture.mp4");
         fs::write(
             &metadata,
-            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=750\nEND=3000\ntitle=OBS marker\n",
+            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=750\ntitle=Opening\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=750\nEND=3000\ntitle=OBS marker\n",
         )
         .expect("chapter metadata fixture");
         let status = StdCommand::new(ffmpeg)
@@ -3158,12 +3158,12 @@ mod tests {
         assert!(status.success());
 
         let chapters = probe_embedded_chapters(&video).expect("probe MP4 chapters");
-        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters.len(), 2);
         assert!(
-            (chapters[0].start_seconds - 0.75).abs() < 0.001,
+            (chapters[1].start_seconds - 0.75).abs() < 0.001,
             "unexpected chapter data: {chapters:?}"
         );
-        assert_eq!(chapters[0].title, "OBS marker");
+        assert_eq!(chapters[1].title, "OBS marker");
     }
 
     #[test]

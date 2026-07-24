@@ -106,7 +106,7 @@ interface CollaborationTransport {
 interface CollaborationEvent {
   sequence: number;
   senderId: string;
-  kind: "transport" | "document";
+  kind: "transport" | "document" | "transport-prepare" | "transport-commit";
   payload: Record<string, unknown>;
 }
 
@@ -115,6 +115,13 @@ interface CollaborationPollResult {
   participantCount: number;
   participants: string[];
   connected: boolean;
+}
+
+interface PlaybackPrepare {
+  operationId: string;
+  position: number;
+  playing: boolean;
+  playbackRate: number;
 }
 
 interface PrecisionSeekAnchor {
@@ -147,6 +154,38 @@ interface SubtitleTimingOverride {
   id: string;
   start: number;
   end: number;
+}
+
+function hasPlaybackBuffer(video: HTMLVideoElement, time: number) {
+  if (video.seeking || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
+  const requiredEnd = Math.min(Number.isFinite(video.duration) ? video.duration : time + 0.2, time + 0.2);
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    if (video.buffered.start(index) <= time + 0.05 && video.buffered.end(index) >= requiredEnd) return true;
+  }
+  return video.buffered.length === 0 && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
+}
+
+function waitForPlaybackBuffer(video: HTMLVideoElement, time: number, timeoutMs = 20_000) {
+  if (hasPlaybackBuffer(video, time)) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const events: Array<keyof HTMLMediaElementEventMap> = ["canplay", "loadeddata", "progress", "seeked"];
+    const finish = (ready: boolean) => {
+      if (settled) return;
+      settled = true;
+      window.clearInterval(interval);
+      window.clearTimeout(timeout);
+      events.forEach((event) => video.removeEventListener(event, check));
+      resolve(ready);
+    };
+    const check = () => {
+      if (hasPlaybackBuffer(video, time)) finish(true);
+    };
+    const interval = window.setInterval(check, 120);
+    const timeout = window.setTimeout(() => finish(false), timeoutMs);
+    events.forEach((event) => video.addEventListener(event, check));
+    check();
+  });
 }
 
 interface AddBookmarkResult {
@@ -336,15 +375,23 @@ function App() {
   const activeExportJobRef = useRef<string | null>(null);
   const exportCancelRequestedRef = useRef(false);
   const precisionSeekRef = useRef<PrecisionSeekAnchor | null>(null);
+  const precisionSeekWasPlayingRef = useRef(false);
   const frameSeekTimerRef = useRef<number | null>(null);
   const credentialLoadedProviderRef = useRef<AnalysisConfig["provider"] | null>(null);
   const credentialStoredValueRef = useRef("");
   const credentialOperationRef = useRef(0);
   const credentialSaveTimerRef = useRef<number | null>(null);
   const remoteTransportUntilRef = useRef(0);
+  const remotePlayEventRef = useRef(false);
+  const remotePauseEventRef = useRef(false);
   const lastSharedMarkdownRef = useRef("");
   const collaborationPollFailuresRef = useRef(0);
   const initialRemotePlayingRef = useRef(false);
+  const activePlaybackOperationRef = useRef<string | null>(null);
+  const playbackOperationPhaseRef = useRef<"preparing" | "committed" | null>(null);
+  const handledPlaybackPrepareRef = useRef(new Set<string>());
+  const playbackCommitTimerRef = useRef<number | null>(null);
+  const seekSyncTimerRef = useRef<number | null>(null);
 
   const [document, setDocument] = useState<SidecarDocument | null>(() =>
     IS_DEMO
@@ -417,6 +464,7 @@ function App() {
   const [collaboration, setCollaboration] = useState<CollaborationSession | null>(null);
   const [collaborationOpen, setCollaborationOpen] = useState(false);
   const [collaborationPhase, setCollaborationPhase] = useState<"idle" | "hosting" | "joining" | "connected" | "reconnecting">("idle");
+  const [playbackSyncStatus, setPlaybackSyncStatus] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState("");
   const [displayName, setDisplayName] = useState(() => localStorage.getItem("framenote:display-name") || "Editor");
   const [shareMode, setShareMode] = useState<"local" | "internet">("local");
@@ -686,7 +734,7 @@ function App() {
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = playbackRate;
     if (mixAudioRef.current) mixAudioRef.current.playbackRate = playbackRate;
-    if (collaboration && videoRef.current && Date.now() >= remoteTransportUntilRef.current) {
+    if (collaboration && videoRef.current && !activePlaybackOperationRef.current && Date.now() >= remoteTransportUntilRef.current) {
       void invoke("publish_collaboration_event", {
         kind: "transport",
         payload: {
@@ -866,6 +914,10 @@ function App() {
     setCollaborationPhase("hosting");
     localStorage.setItem("framenote:display-name", displayName.trim() || "Host");
     try {
+      const video = videoRef.current;
+      const initialPosition = Math.max(0, video?.currentTime ?? currentTimeRef.current);
+      const initialPlaybackRate = video?.playbackRate ?? playbackRate;
+      const initialPlaying = video ? !video.paused : false;
       let session: CollaborationSession;
       if (shareMode === "internet") {
         localStorage.setItem("framenote:relay-url", relayUrl);
@@ -873,11 +925,21 @@ function App() {
           relayUrl,
           videoPath: document.videoPath,
           displayName,
+          initialTransport: {
+            position: initialPosition,
+            playing: initialPlaying,
+            playbackRate: initialPlaybackRate,
+          },
         });
       } else {
         session = await invoke<CollaborationSession>("host_collaboration", {
           videoPath: document.videoPath,
           displayName,
+          initialTransport: {
+            position: initialPosition,
+            playing: initialPlaying,
+            playbackRate: initialPlaybackRate,
+          },
         });
       }
       lastSharedMarkdownRef.current = document.markdown;
@@ -889,7 +951,7 @@ function App() {
       setCollaborationPhase("idle");
       showNotice(errorMessage(error), "error");
     }
-  }, [displayName, document, relayUrl, shareMode, showNotice]);
+  }, [displayName, document, playbackRate, relayUrl, shareMode, showNotice]);
 
   const joinSharing = useCallback(async () => {
     if (!IS_TAURI) return;
@@ -962,6 +1024,21 @@ function App() {
       setCollaborationPhase("idle");
       setCollaborationOpen(false);
       collaborationPollFailuresRef.current = 0;
+      activePlaybackOperationRef.current = null;
+      playbackOperationPhaseRef.current = null;
+      remotePlayEventRef.current = false;
+      remotePauseEventRef.current = false;
+      remoteTransportUntilRef.current = 0;
+      handledPlaybackPrepareRef.current.clear();
+      setPlaybackSyncStatus(null);
+      if (playbackCommitTimerRef.current) {
+        window.clearTimeout(playbackCommitTimerRef.current);
+        playbackCommitTimerRef.current = null;
+      }
+      if (seekSyncTimerRef.current) {
+        window.clearTimeout(seekSyncTimerRef.current);
+        seekSyncTimerRef.current = null;
+      }
       if (wasGuest) {
         stopMix();
         setDocument(null);
@@ -986,7 +1063,7 @@ function App() {
 
   const publishTransport = useCallback((transport?: Partial<CollaborationTransport>) => {
     const video = videoRef.current;
-    if (!collaboration || !video || Date.now() < remoteTransportUntilRef.current) return;
+    if (!collaboration || !video || activePlaybackOperationRef.current || Date.now() < remoteTransportUntilRef.current) return;
     const payload: CollaborationTransport = {
       position: Math.max(0, transport?.position ?? video.currentTime),
       playing: transport?.playing ?? !video.paused,
@@ -996,6 +1073,116 @@ function App() {
     void invoke("publish_collaboration_event", { kind: "transport", payload })
       .catch(() => setCollaborationPhase("reconnecting"));
   }, [collaboration]);
+
+  const requestSynchronizedPlayback = useCallback((position: number, playbackRate?: number) => {
+    const video = videoRef.current;
+    if (!collaboration || !video) return;
+    if (playbackCommitTimerRef.current) {
+      window.clearTimeout(playbackCommitTimerRef.current);
+      playbackCommitTimerRef.current = null;
+    }
+    const operationId = typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${collaboration.clientId}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    activePlaybackOperationRef.current = operationId;
+    playbackOperationPhaseRef.current = "preparing";
+    setPlaybackSyncStatus("Preparing everyone…");
+    void invoke("publish_collaboration_event", {
+      kind: "transport-prepare",
+      payload: {
+        operationId,
+        position: Math.max(0, position),
+        playing: true,
+        playbackRate: playbackRate ?? video.playbackRate,
+      },
+    }).catch((error) => {
+      if (activePlaybackOperationRef.current === operationId) {
+        activePlaybackOperationRef.current = null;
+        playbackOperationPhaseRef.current = null;
+        setPlaybackSyncStatus(null);
+      }
+      setCollaborationPhase("reconnecting");
+      showNotice(errorMessage(error), "error");
+    });
+  }, [collaboration, showNotice]);
+
+  const prepareSynchronizedPlayback = useCallback(async (prepare: PlaybackPrepare) => {
+    if (!collaboration || !prepare.operationId || handledPlaybackPrepareRef.current.has(prepare.operationId)) return;
+    if (!Number.isFinite(prepare.position) || !Number.isFinite(prepare.playbackRate) || !prepare.playing) return;
+    handledPlaybackPrepareRef.current.add(prepare.operationId);
+    if (handledPlaybackPrepareRef.current.size > 64) {
+      const oldest = handledPlaybackPrepareRef.current.values().next().value;
+      if (oldest) handledPlaybackPrepareRef.current.delete(oldest);
+    }
+    activePlaybackOperationRef.current = prepare.operationId;
+    playbackOperationPhaseRef.current = "preparing";
+    if (playbackCommitTimerRef.current) {
+      window.clearTimeout(playbackCommitTimerRef.current);
+      playbackCommitTimerRef.current = null;
+    }
+    const video = videoRef.current;
+    if (!video) return;
+    remoteTransportUntilRef.current = Date.now() + 25_000;
+    video.pause();
+    video.playbackRate = prepare.playbackRate;
+    setPlaybackRate(prepare.playbackRate);
+    const position = Math.max(0, Math.min(video.duration || Number.POSITIVE_INFINITY, prepare.position));
+    if (Math.abs(video.currentTime - position) > 0.04) video.currentTime = position;
+    currentTimeRef.current = position;
+    setCurrentTime(position);
+    setPlaybackSyncStatus("Buffering for everyone…");
+    const ready = await waitForPlaybackBuffer(video, position);
+    if (activePlaybackOperationRef.current !== prepare.operationId) return;
+    if (!ready) {
+      setPlaybackSyncStatus("Waiting for media…");
+      showNotice("Playback is waiting because this video position has not buffered yet.", "error");
+      return;
+    }
+    setPlaybackSyncStatus("Waiting for everyone…");
+    void invoke("publish_collaboration_event", {
+      kind: "transport-ready",
+      payload: { operationId: prepare.operationId },
+    }).catch((error) => {
+      setCollaborationPhase("reconnecting");
+      showNotice(errorMessage(error), "error");
+    });
+  }, [collaboration, showNotice]);
+
+  const applyPlaybackCommit = useCallback((payload: Record<string, unknown>) => {
+    const operationId = typeof payload.operationId === "string" ? payload.operationId : "";
+    const position = Number(payload.position);
+    const playbackRate = Number(payload.playbackRate);
+    const startAtMs = Number(payload.startAtMs);
+    if (!operationId || !Number.isFinite(position) || !Number.isFinite(playbackRate) || !Number.isFinite(startAtMs)) return;
+    if (activePlaybackOperationRef.current && activePlaybackOperationRef.current !== operationId) return;
+    activePlaybackOperationRef.current = operationId;
+    playbackOperationPhaseRef.current = "committed";
+    const video = videoRef.current;
+    if (!video) return;
+    if (playbackCommitTimerRef.current) window.clearTimeout(playbackCommitTimerRef.current);
+    const delay = Math.max(0, startAtMs - Date.now());
+    remoteTransportUntilRef.current = Date.now() + delay + 2_500;
+    video.playbackRate = playbackRate;
+    setPlaybackRate(playbackRate);
+    video.currentTime = Math.max(0, Math.min(video.duration || Number.POSITIVE_INFINITY, position));
+    currentTimeRef.current = video.currentTime;
+    setCurrentTime(video.currentTime);
+    setPlaybackSyncStatus("Starting together…");
+    playbackCommitTimerRef.current = window.setTimeout(() => {
+      playbackCommitTimerRef.current = null;
+      const currentVideo = videoRef.current;
+      if (!currentVideo) return;
+      remotePlayEventRef.current = true;
+      void currentVideo.play().catch(() => {
+        remotePlayEventRef.current = false;
+        activePlaybackOperationRef.current = null;
+        playbackOperationPhaseRef.current = null;
+        remoteTransportUntilRef.current = 0;
+        setPlaybackSyncStatus(null);
+        showNotice("Click the player once to allow synchronized playback.", "error");
+      });
+    }, delay);
+  }, [showNotice]);
 
   useEffect(() => {
     if (!collaboration || !document || !IS_TAURI) return;
@@ -1031,6 +1218,19 @@ function App() {
           participants: result.participants,
         } : current);
         for (const event of result.events) {
+          if (event.kind === "transport-prepare") {
+            void prepareSynchronizedPlayback({
+              operationId: typeof event.payload.operationId === "string" ? event.payload.operationId : "",
+              position: Number(event.payload.position),
+              playing: event.payload.playing === true,
+              playbackRate: Number(event.payload.playbackRate),
+            });
+            continue;
+          }
+          if (event.kind === "transport-commit") {
+            applyPlaybackCommit(event.payload);
+            continue;
+          }
           if (event.senderId === collaboration.clientId) continue;
           if (event.kind === "document") {
             const markdown = typeof event.payload.markdown === "string" ? event.payload.markdown : null;
@@ -1048,6 +1248,16 @@ function App() {
             const emittedAt = Number(event.payload.emittedAt);
             const video = videoRef.current;
             if (!video || !Number.isFinite(rawPosition) || !Number.isFinite(playbackRate)) continue;
+            if (activePlaybackOperationRef.current) {
+              if (playbackOperationPhaseRef.current === "preparing" || playing) continue;
+              if (playbackCommitTimerRef.current) {
+                window.clearTimeout(playbackCommitTimerRef.current);
+                playbackCommitTimerRef.current = null;
+              }
+              activePlaybackOperationRef.current = null;
+              playbackOperationPhaseRef.current = null;
+              setPlaybackSyncStatus(null);
+            }
             const transitSeconds = playing && Number.isFinite(emittedAt)
               ? Math.max(0, Math.min(5, (Date.now() - emittedAt) / 1_000))
               : 0;
@@ -1061,8 +1271,13 @@ function App() {
               setCurrentTime(video.currentTime);
             }
             if (playing && video.paused) {
-              void video.play().catch(() => showNotice("Click the player once to allow synchronized playback.", "error"));
+              remotePlayEventRef.current = true;
+              void video.play().catch(() => {
+                remotePlayEventRef.current = false;
+                showNotice("Click the player once to allow synchronized playback.", "error");
+              });
             } else if (!playing && !video.paused) {
+              remotePauseEventRef.current = true;
               video.pause();
             }
           }
@@ -1081,7 +1296,7 @@ function App() {
       cancelled = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [applyDocument, collaboration?.clientId, collaboration?.mode, collaboration?.code, showNotice]);
+  }, [applyDocument, applyPlaybackCommit, collaboration?.clientId, collaboration?.mode, collaboration?.code, prepareSynchronizedPlayback, showNotice]);
 
   useEffect(() => {
     if (collaboration?.mode !== "host" || !isPlaying) return;
@@ -1109,9 +1324,10 @@ function App() {
   const togglePlayback = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    if (video.paused) void video.play();
+    if (video.paused && collaboration) requestSynchronizedPlayback(video.currentTime);
+    else if (video.paused) void video.play();
     else video.pause();
-  }, []);
+  }, [collaboration, requestSynchronizedPlayback]);
 
   const toggleFullscreen = useCallback(async () => {
     if (IS_TAURI) {
@@ -1128,7 +1344,14 @@ function App() {
     if (videoRef.current) videoRef.current.currentTime = next;
     currentTimeRef.current = next;
     setCurrentTime(next);
-  }, [duration]);
+    if (collaboration && activePlaybackOperationRef.current && !precisionSeekRef.current) {
+      if (seekSyncTimerRef.current) window.clearTimeout(seekSyncTimerRef.current);
+      seekSyncTimerRef.current = window.setTimeout(() => {
+        seekSyncTimerRef.current = null;
+        requestSynchronizedPlayback(currentTimeRef.current);
+      }, 120);
+    }
+  }, [collaboration, duration, requestSynchronizedPlayback]);
 
   const stepFrame = useCallback((direction: -1 | 1) => {
     const video = videoRef.current;
@@ -1158,6 +1381,8 @@ function App() {
       startTime,
       width: bounds.width,
     };
+    precisionSeekWasPlayingRef.current = videoRef.current ? !videoRef.current.paused : false;
+    if (precisionSeekWasPlayingRef.current) videoRef.current?.pause();
     seekTo(startTime);
     setPrecisionSeek({ time: startTime, scale: 1, lift: 0 });
   }, [duration, seekTo]);
@@ -1183,7 +1408,13 @@ function App() {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     setPrecisionSeek(null);
-  }, []);
+    const shouldResumeTogether = precisionSeekWasPlayingRef.current || Boolean(collaboration && activePlaybackOperationRef.current);
+    precisionSeekWasPlayingRef.current = false;
+    if (shouldResumeTogether) {
+      if (collaboration) requestSynchronizedPlayback(currentTimeRef.current);
+      else void videoRef.current?.play();
+    }
+  }, [collaboration, requestSynchronizedPlayback]);
 
   const handleLoadedMetadata = useCallback((video: HTMLVideoElement) => {
     setDuration(video.duration);
@@ -1201,10 +1432,9 @@ function App() {
     resumePositionRef.current = 0;
     if (initialRemotePlayingRef.current) {
       initialRemotePlayingRef.current = false;
-      remoteTransportUntilRef.current = Date.now() + 1_200;
-      void video.play().catch(() => showNotice("Click the player once to allow synchronized playback.", "error"));
+      requestSynchronizedPlayback(video.currentTime, video.playbackRate);
     }
-  }, [showNotice, updateRecentPlayback]);
+  }, [requestSynchronizedPlayback, showNotice, updateRecentPlayback]);
 
   const handleTimeUpdate = useCallback((video: HTMLVideoElement) => {
     const time = video.currentTime;
@@ -1218,16 +1448,34 @@ function App() {
   }, [mixState, mixerActive, startMixAt]);
 
   const handleVideoPlay = useCallback((video: HTMLVideoElement) => {
+    const synchronizedStart = playbackOperationPhaseRef.current === "committed";
+    const remotelyApplied = remotePlayEventRef.current;
+    remotePlayEventRef.current = false;
+    if (collaboration && !synchronizedStart && !remotelyApplied) {
+      video.pause();
+      requestSynchronizedPlayback(video.currentTime, video.playbackRate);
+      return;
+    }
+    if (synchronizedStart) {
+      activePlaybackOperationRef.current = null;
+      playbackOperationPhaseRef.current = null;
+    }
+    setPlaybackSyncStatus(null);
     setIsPlaying(true);
     if (mixerActive) startMixAt(video.currentTime);
-    publishTransport({ position: video.currentTime, playing: true });
-  }, [mixerActive, publishTransport, startMixAt]);
+    if (!remotelyApplied) publishTransport({ position: video.currentTime, playing: true });
+  }, [collaboration, mixerActive, publishTransport, requestSynchronizedPlayback, startMixAt]);
 
   const handleVideoPause = useCallback((video: HTMLVideoElement) => {
+    const remotelyApplied = remotePauseEventRef.current;
+    remotePauseEventRef.current = false;
     setIsPlaying(false);
     mixAudioRef.current?.pause();
     void persistPlaybackPosition(video.currentTime).catch(() => undefined);
-    publishTransport({ position: video.currentTime, playing: false });
+    if (!remotelyApplied) {
+      remoteTransportUntilRef.current = 0;
+      publishTransport({ position: video.currentTime, playing: false });
+    }
   }, [persistPlaybackPosition, publishTransport]);
 
   const handleVideoEnded = useCallback(() => {
@@ -1239,9 +1487,14 @@ function App() {
 
   const handleSeeked = useCallback((video: HTMLVideoElement) => {
     currentTimeRef.current = video.currentTime;
+    if (collaboration && !video.paused && Date.now() >= remoteTransportUntilRef.current) {
+      video.pause();
+      requestSynchronizedPlayback(video.currentTime, video.playbackRate);
+      return;
+    }
     if (mixerActive && !video.paused) startMixAt(video.currentTime);
     publishTransport({ position: video.currentTime, playing: !video.paused });
-  }, [mixerActive, publishTransport, startMixAt]);
+  }, [collaboration, mixerActive, publishTransport, requestSynchronizedPlayback, startMixAt]);
 
   const addBookmark = useCallback(async () => {
     if (!document || !IS_TAURI) {
@@ -1591,6 +1844,49 @@ function App() {
     }
   }, []);
 
+  const returnToRecentProjects = useCallback(async () => {
+    if (exportPhase === "running") {
+      showNotice("Stop the current clip export before returning to recent projects.", "error");
+      return;
+    }
+    if (analysisPhase === "running") {
+      showNotice("Pause the current analysis before returning to recent projects.", "error");
+      return;
+    }
+    if (rawDirty) {
+      showNotice("Save the Markdown changes before returning to recent projects.", "error");
+      return;
+    }
+    const video = videoRef.current;
+    if (video && !video.paused) video.pause();
+    try {
+      await persistPlaybackPosition(video?.currentTime ?? currentTimeRef.current);
+      if (collaboration) await stopSharing();
+      stopMix();
+      documentRef.current = null;
+      setDocument(null);
+      setVideoUrl(null);
+      setMediaRegistration(null);
+      setIsPlaying(false);
+      setDuration(0);
+      setCurrentTime(0);
+      currentTimeRef.current = 0;
+      setWaveform(null);
+      setWaveformPhase("idle");
+      setWaveformOpen(false);
+      setWaveformSelection(null);
+      setEditingId(null);
+      setSubtitleTimingOverride(null);
+      setAnalysisOpen(false);
+      setExportOpen(false);
+      setSettingsOpen(false);
+      setRawMode(false);
+      setCollaborationOpen(false);
+    } catch (error) {
+      showNotice(errorMessage(error), "error");
+    }
+  }, [analysisPhase, collaboration, exportPhase, persistPlaybackPosition, rawDirty, showNotice, stopMix, stopSharing]);
+
   const chooseExportDestination = useCallback(async () => {
     if (!IS_TAURI) {
       showNotice("Open the Tauri desktop app to choose an export folder.", "error");
@@ -1868,7 +2164,7 @@ function App() {
   return (
     <main className="app-shell">
       <header className="app-header">
-        <Brand />
+        <Brand onClick={() => void returnToRecentProjects()} />
         <div className="file-identity">
           <strong>{document.videoName}</strong>
           <span title={document.sidecarPath}>{collaboration ? <Users size={12} /> : <Check size={12} />} {collaboration ? `${collaboration.mode === "host" ? "Hosting" : "Joined"} · ${collaboration.participantCount} live` : `${document.sidecarPath.split(/[\\/]/).at(-1)} saved`}</span>
@@ -1987,7 +2283,12 @@ function App() {
                 ))}
               </div>
             )}
-            {!isPlaying && !IS_DEMO && <button className="center-play" aria-label="Play" onClick={togglePlayback}><Play size={26} fill="currentColor" /></button>}
+            {playbackSyncStatus && (
+              <div className="center-sync-spinner" role="status" aria-live="polite" aria-label={playbackSyncStatus}>
+                <RefreshCw className="spin" size={28} />
+              </div>
+            )}
+            {!isPlaying && !playbackSyncStatus && !IS_DEMO && <button className="center-play" aria-label="Play" onClick={togglePlayback}><Play size={26} fill="currentColor" /></button>}
             {mixerOpen && mediaRegistration && (
               <AudioMixer
                 tracks={mediaRegistration.audioTracks}
@@ -2731,8 +3032,11 @@ function WaveformLens({
   );
 }
 
-function Brand() {
-  return <div className="brand"><span className="brand-mark"><Play size={12} fill="currentColor" /></span><strong>FrameNote</strong></div>;
+function Brand({ onClick }: { onClick?: () => void }) {
+  const content = <><span className="brand-mark"><Play size={12} fill="currentColor" /></span><strong>FrameNote</strong></>;
+  return onClick
+    ? <button type="button" className="brand brand-button" onClick={onClick} aria-label="Return to recent projects" title="Recent projects">{content}</button>
+    : <div className="brand">{content}</div>;
 }
 
 function Notice({ notice, onClose }: { notice: { tone: "info" | "error"; text: string }; onClose: () => void }) {

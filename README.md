@@ -10,7 +10,7 @@ Open `recording.mp4` and FrameNote creates or reads `recording.md` in the same f
 - Adjacent Markdown sidecars with no video copying or mutation
 - `N` to start an editable mark and `M` to end the nearest preceding open mark
 - One-time import of OBS Hybrid MP4/MOV chapter markers as editable point bookmarks
-- Direct local-network watch sessions with six-digit discovery codes, host-served video, shared playback, marks, subtitles, and Markdown
+- Direct local-network or internet-relay watch sessions with six-digit codes, host-served video, shared playback, marks, subtitles, and Markdown
 - Clickable bookmarks and AI entries that seek the video
 - Raw Markdown editor plus automatic reload when the app regains focus
 - Playback shortcuts: Space, Left/Right (10 seconds), F, N (start mark), and M (end mark)
@@ -57,11 +57,15 @@ npm run tauri:dev
 
 Web-only UI development is also available with `npm run dev`, but native file selection, sidecar writes, and analysis require Tauri.
 
-## Watch together on the local network
+## Watch together
 
-Open a project and choose **Share → Create**. FrameNote advertises a random six-digit code only on the current local network. Other FrameNote instances choose **Join session**, enter that code, and stream the original video directly from the host with HTTP byte-range seeking. Play, pause, seek, playback rate, marks, subtitles, AI entries, and raw Markdown updates propagate in both directions; the host remains the owner of the canonical adjacent sidecar.
+Open a project and choose **Share → Create session**. Other FrameNote instances choose **Join session** and enter the six-digit code. Play, pause, seek, playback rate, marks, subtitles, AI entries, and raw Markdown updates propagate in both directions; the host remains the owner of the canonical adjacent sidecar.
 
-There is no FrameNote account, cloud upload, external signaling service, or central relay. The host app is the direct peer and must remain open. This serverless discovery model is intentionally LAN-only: peers must be on the same Wi-Fi/Ethernet network, multicast DNS must be allowed, and guest access ends when the host ends the session. Internet sharing across routers would require a signaling and usually TURN relay service, which this local-first mode does not use.
+**Local network** mode discovers the host over multicast DNS and connects directly over the same Wi-Fi/Ethernet network. It needs no FrameNote account, upload, signaling service, or relay. Multicast DNS must be allowed, and guest access ends when the host ends the session.
+
+**Internet** mode uses the configured lightweight relay to tunnel HTTP control requests and bounded media byte ranges to the host. The relay does not store projects or transcode video, but the requested original video bytes do pass through it. Each guest exposes a standards-compliant local range server to its webview while fetching fixed 2 MiB pieces lazily behind the scenes. Pieces are aligned and cached on disk for the session, so repeated playback and nearby seeks do not resend the same bytes. This reduces duplicate traffic without running a transcoder; reducing the bitrate of unique video content would require an alternate encoded rendition.
+
+Starting playback or seeking while playing uses a prepare/ready/commit barrier. Every active participant pauses at the target, buffers it, and acknowledges readiness before the host publishes a shared start time. Pausing remains immediate. A guest that cannot buffer stays visibly in a waiting state instead of letting the other participants run ahead.
 
 On macOS, allow FrameNote's Local Network permission when prompted. On Windows, allow FrameNote on private networks if Windows Defender Firewall prompts; public-network access is not needed. AI analysis, waveform extraction, and rough-cut export run on the host because the original file never gets copied to guests; their resulting sidecar entries appear for every peer.
 

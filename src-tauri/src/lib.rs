@@ -1,10 +1,9 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use tungstenite::Message;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
-    fs::{self, File},
+    collections::{HashMap, HashSet, VecDeque},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -20,6 +19,7 @@ use tauri::{Manager, State};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use tokio::{process::Command, time::timeout};
 use tokio_util::sync::CancellationToken;
+use tungstenite::Message;
 use uuid::Uuid;
 
 const CANCELLED: &str = "ANALYSIS_CANCELLED";
@@ -34,6 +34,7 @@ const EMBEDDED_CHAPTER_MARKER: &str = "<!-- framenote:embedded-chapters fingerpr
 const COLLABORATION_SERVICE_TYPE: &str = "_framenote._tcp.local.";
 const COLLABORATION_EVENT_LIMIT: usize = 1024;
 const COLLABORATION_PEER_TTL: Duration = Duration::from_secs(12);
+const PLAYBACK_START_DELAY_MS: u64 = 1_500;
 
 struct AppState {
     jobs: Mutex<HashMap<String, CancellationToken>>,
@@ -60,14 +61,24 @@ impl AppState {
 #[derive(Clone)]
 enum MediaSource {
     Local(PathBuf),
-    Remote(RemoteMediaSource),
+    CachedRemote(CachedRemoteMediaSource),
 }
 
 #[derive(Clone)]
-struct RemoteMediaSource {
+struct CachedRemoteMediaSource {
     media_url: String,
     mix_url: String,
     content_type: String,
+    cache_path: PathBuf,
+    cache_state: Arc<Mutex<RemoteMediaCacheState>>,
+    fetch_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Default)]
+struct RemoteMediaCacheState {
+    total_size: Option<u64>,
+    /// Sorted, non-overlapping inclusive byte ranges present in `cache_path`.
+    ranges: Vec<(u64, u64)>,
 }
 
 #[derive(Clone)]
@@ -108,17 +119,26 @@ struct HostedSession {
 }
 
 struct HostedSessionRuntime {
+    host_client_id: String,
     sequence: u64,
     document_revision: u64,
     markdown: String,
     transport: CollaborationTransport,
     events: VecDeque<CollaborationEvent>,
     peers: HashMap<String, PeerPresence>,
+    playback_barrier: Option<PlaybackBarrier>,
 }
 
 struct PeerPresence {
     name: String,
     last_seen: Instant,
+}
+
+struct PlaybackBarrier {
+    operation_id: String,
+    transport: CollaborationTransport,
+    expected: HashSet<String>,
+    ready: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -139,6 +159,21 @@ struct CollaborationTransport {
     position: f64,
     playing: bool,
     playback_rate: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaybackPreparePayload {
+    operation_id: String,
+    position: f64,
+    playing: bool,
+    playback_rate: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaybackReadyPayload {
+    operation_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -503,22 +538,32 @@ fn respond_local_media(request: Request, path: &Path) {
         let _ = request.respond(Response::empty(StatusCode(416)));
         return;
     }
+    let has_range_header = request
+        .headers()
+        .iter()
+        .any(|candidate| candidate.field.equiv("Range"));
     let range = requested_range(&request, size);
+    if has_range_header && range.is_none() {
+        let response = Response::empty(StatusCode(416))
+            .with_header(header("Content-Range", &format!("bytes */{size}")));
+        let _ = request.respond(response);
+        return;
+    }
     let (start, mut end, status) = match range {
         Some((start, end)) => (start, end, StatusCode(206)),
         None => (0, size - 1, StatusCode(200)),
     };
-    // Cap each chunk to MAX_VIDEO_CHUNK so that even a "bytes=0-" (entire
-    // file) request doesn't send the whole video in one shot. The browser
-    // will see the Content-Range header and request the next chunk.
-    if end - start + 1 > MAX_VIDEO_CHUNK {
+    // Only cap actual range responses. Capping a plain 200/HEAD would falsely
+    // tell the browser that a large MP4 is only one chunk long, preventing it
+    // from finding metadata stored near the end of the file.
+    if status == StatusCode(206) && end - start + 1 > MAX_VIDEO_CHUNK {
         end = start + MAX_VIDEO_CHUNK - 1;
     }
     let length = end - start + 1;
     let mut headers = vec![
         header("Accept-Ranges", "bytes"),
         header("Content-Type", media_content_type(path)),
-        header("Cache-Control", "no-store"),
+        header("Cache-Control", "private, max-age=3600"),
         header("Access-Control-Allow-Origin", "*"),
     ];
     if status == StatusCode(206) {
@@ -528,26 +573,27 @@ fn respond_local_media(request: Request, path: &Path) {
         ));
     }
     if request.method() == &Method::Head {
-        let _ = request.respond(Response::new(
-            status,
-            headers,
-            std::io::empty(),
-            Some(length as usize),
-            None,
-        ));
+        headers.push(header("Content-Length", &length.to_string()));
+        let _ = request.respond(
+            Response::new(status, headers, std::io::empty(), None, None)
+                .with_chunked_threshold(usize::MAX),
+        );
         return;
     }
     if file.seek(SeekFrom::Start(start)).is_err() {
         let _ = request.respond(Response::empty(StatusCode(500)));
         return;
     }
-    let _ = request.respond(Response::new(
-        status,
-        headers,
-        file.take(length),
-        Some(length as usize),
-        None,
-    ));
+    let _ = request.respond(
+        Response::new(
+            status,
+            headers,
+            file.take(length),
+            Some(length as usize),
+            None,
+        )
+        .with_chunked_threshold(usize::MAX),
+    );
 }
 
 fn respond_remote_proxy(request: Request, url: &str, fallback_content_type: &str) {
@@ -589,7 +635,11 @@ fn respond_remote_proxy(request: Request, url: &str, fallback_content_type: &str
     };
     let status = StatusCode(response.status().as_u16());
     let length = response
-        .content_length()
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| response.content_length())
         .and_then(|value| usize::try_from(value).ok());
     let mut headers = vec![
         header("Accept-Ranges", "bytes"),
@@ -611,7 +661,298 @@ fn respond_remote_proxy(request: Request, url: &str, fallback_content_type: &str
     {
         headers.push(header("Content-Range", value));
     }
-    let _ = request.respond(Response::new(status, headers, response, length, None));
+    if request.method() == &Method::Head {
+        if let Some(length) = length {
+            headers.push(header("Content-Length", &length.to_string()));
+        }
+        let _ = request.respond(
+            Response::new(status, headers, std::io::empty(), None, None)
+                .with_chunked_threshold(usize::MAX),
+        );
+    } else {
+        let _ = request.respond(
+            Response::new(status, headers, response, length, None)
+                .with_chunked_threshold(usize::MAX),
+        );
+    }
+}
+
+fn track_cached_range(cached: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    cached.push((start, end));
+    cached.sort_unstable_by_key(|&(s, _)| s);
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for &(s, e) in cached.iter() {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1.saturating_add(1) {
+                last.1 = last.1.max(e);
+            } else {
+                merged.push((s, e));
+            }
+        } else {
+            merged.push((s, e));
+        }
+    }
+    *cached = merged;
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    let total = total.parse::<u64>().ok()?;
+    (total > 0 && start <= end && end < total).then_some((start, end, total))
+}
+
+fn cached_range_end(source: &CachedRemoteMediaSource, position: u64) -> Option<u64> {
+    source
+        .cache_state
+        .lock()
+        .ok()?
+        .ranges
+        .iter()
+        .find_map(|&(cached_start, cached_end)| {
+            (cached_start <= position && position <= cached_end).then_some(cached_end)
+        })
+}
+
+fn remote_media_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| format!("Could not prepare the shared media connection: {error}"))
+}
+
+fn ensure_remote_media_size(source: &CachedRemoteMediaSource) -> Result<u64, String> {
+    if let Some(total) = source
+        .cache_state
+        .lock()
+        .ok()
+        .and_then(|state| state.total_size)
+    {
+        return Ok(total);
+    }
+    let response = remote_media_client()?
+        .head(&source.media_url)
+        .send()
+        .map_err(|error| format!("The sharing peer is unavailable: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "The sharing peer returned {} while reading media metadata.",
+            response.status()
+        ));
+    }
+    let total = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "The sharing peer did not report the video size.".to_string())?;
+    let mut state = source
+        .cache_state
+        .lock()
+        .map_err(|_| "The shared media cache is unavailable.".to_string())?;
+    state.total_size = Some(total);
+    Ok(total)
+}
+
+fn fetch_remote_media_chunk(
+    source: &CachedRemoteMediaSource,
+    start: u64,
+    total: u64,
+) -> Result<u64, String> {
+    if let Some(end) = cached_range_end(source, start) {
+        return Ok(end);
+    }
+    let _fetch_guard = source
+        .fetch_lock
+        .lock()
+        .map_err(|_| "The shared media cache is unavailable.".to_string())?;
+    if let Some(end) = cached_range_end(source, start) {
+        return Ok(end);
+    }
+    let fetch_start = (start / MAX_VIDEO_CHUNK) * MAX_VIDEO_CHUNK;
+    let requested_end = fetch_start
+        .saturating_add(MAX_VIDEO_CHUNK - 1)
+        .min(total.saturating_sub(1));
+    let response = remote_media_client()?
+        .get(&source.media_url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={fetch_start}-{requested_end}"),
+        )
+        .send()
+        .map_err(|error| format!("The sharing peer is unavailable: {error}"))?;
+    let status = response.status();
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)
+        .filter(|&(actual_start, actual_end, actual_total)| {
+            status == reqwest::StatusCode::PARTIAL_CONTENT
+                && actual_start == fetch_start
+                && actual_end <= requested_end
+                && actual_total == total
+        })
+        .ok_or_else(|| "The sharing peer returned an invalid media range.".to_string())?;
+    let (actual_start, actual_end, _) = content_range;
+    let body = response
+        .bytes()
+        .map_err(|error| format!("The shared media chunk was interrupted: {error}"))?;
+    if body.len() as u64 != actual_end - actual_start + 1 {
+        return Err("The shared media chunk had an invalid byte length.".into());
+    }
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&source.cache_path)?;
+        file.set_len(total)?;
+        file.seek(SeekFrom::Start(actual_start))?;
+        file.write_all(&body)
+    })();
+    write_result.map_err(|error| format!("Could not cache shared media: {error}"))?;
+    let mut state = source
+        .cache_state
+        .lock()
+        .map_err(|_| "The shared media cache is unavailable.".to_string())?;
+    state.total_size = Some(total);
+    track_cached_range(&mut state.ranges, actual_start, actual_end);
+    drop(state);
+    cached_range_end(source, start)
+        .ok_or_else(|| "The shared media cache did not contain the requested byte.".to_string())
+}
+
+struct RemoteMediaReader {
+    source: CachedRemoteMediaSource,
+    position: u64,
+    end: u64,
+    total: u64,
+    file: Option<File>,
+    available_end: u64,
+}
+
+impl RemoteMediaReader {
+    fn new(source: CachedRemoteMediaSource, start: u64, end: u64, total: u64) -> Self {
+        Self {
+            source,
+            position: start,
+            end,
+            total,
+            file: None,
+            available_end: 0,
+        }
+    }
+
+    fn prepare_interval(&mut self) -> std::io::Result<()> {
+        let available_end = cached_range_end(&self.source, self.position)
+            .map(Ok)
+            .unwrap_or_else(|| {
+                fetch_remote_media_chunk(&self.source, self.position, self.total)
+                    .map_err(std::io::Error::other)
+            })?;
+        let mut file = File::open(&self.source.cache_path)?;
+        file.seek(SeekFrom::Start(self.position))?;
+        self.file = Some(file);
+        self.available_end = available_end.min(self.end);
+        Ok(())
+    }
+}
+
+impl Read for RemoteMediaReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.position > self.end {
+            return Ok(0);
+        }
+        if self.file.is_none() || self.position > self.available_end {
+            self.prepare_interval()?;
+        }
+        let available = self.available_end - self.position + 1;
+        let length = buffer
+            .len()
+            .min(usize::try_from(available).unwrap_or(usize::MAX));
+        let read = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Shared media cache is unavailable."))?
+            .read(&mut buffer[..length])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Shared media cache ended before the requested range.",
+            ));
+        }
+        self.position = self.position.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+fn respond_cached_remote_proxy(request: Request, source: &CachedRemoteMediaSource) {
+    if !matches!(request.method(), Method::Get | Method::Head) {
+        let _ = request.respond(Response::empty(StatusCode(405)));
+        return;
+    }
+    let total = match ensure_remote_media_size(source) {
+        Ok(total) => total,
+        Err(error) => {
+            let _ = request.respond(Response::from_string(error).with_status_code(503));
+            return;
+        }
+    };
+    let has_range = request
+        .headers()
+        .iter()
+        .any(|candidate| candidate.field.equiv("Range"));
+    let (start, end, status) = if has_range {
+        let Some((start, end)) = requested_range(&request, total) else {
+            let _ = request.respond(
+                Response::empty(StatusCode(416))
+                    .with_header(header("Content-Range", &format!("bytes */{total}"))),
+            );
+            return;
+        };
+        (start, end, StatusCode(206))
+    } else {
+        (0, total - 1, StatusCode(200))
+    };
+    let length = end - start + 1;
+    let Some(length_usize) = usize::try_from(length).ok() else {
+        let _ = request.respond(
+            Response::from_string("This shared video is too large for this platform.")
+                .with_status_code(413),
+        );
+        return;
+    };
+    let mut headers = vec![
+        header("Accept-Ranges", "bytes"),
+        header("Cache-Control", "private, max-age=3600"),
+        header("Access-Control-Allow-Origin", "*"),
+        header("Content-Type", &source.content_type),
+    ];
+    if status == StatusCode(206) {
+        headers.push(header(
+            "Content-Range",
+            &format!("bytes {start}-{end}/{total}"),
+        ));
+    }
+    if request.method() == &Method::Head {
+        let _ = request.respond(
+            Response::new(status, headers, std::io::empty(), Some(length_usize), None)
+                .with_chunked_threshold(usize::MAX),
+        );
+        return;
+    }
+    let reader = RemoteMediaReader::new(source.clone(), start, end, total);
+    let _ = request.respond(
+        Response::new(status, headers, reader, Some(length_usize), None)
+            .with_chunked_threshold(usize::MAX),
+    );
 }
 
 fn respond_media(request: Request, files: &RwLock<HashMap<String, MediaSource>>) {
@@ -632,9 +973,7 @@ fn respond_media(request: Request, files: &RwLock<HashMap<String, MediaSource>>)
     };
     match source {
         MediaSource::Local(path) => respond_local_media(request, &path),
-        MediaSource::Remote(remote) => {
-            respond_remote_proxy(request, &remote.media_url, &remote.content_type)
-        }
+        MediaSource::CachedRemote(remote) => respond_cached_remote_proxy(request, &remote),
     }
 }
 
@@ -780,7 +1119,7 @@ fn respond_audio_mix(request: Request, files: &RwLock<HashMap<String, MediaSourc
     };
     match source {
         MediaSource::Local(path) => respond_audio_mix_for_path(request, &path),
-        MediaSource::Remote(remote) => {
+        MediaSource::CachedRemote(remote) => {
             let url = parsed
                 .query()
                 .map(|query| format!("{}?{query}", remote.mix_url))
@@ -850,6 +1189,14 @@ fn prune_peers(runtime: &mut HostedSessionRuntime) {
     runtime
         .peers
         .retain(|_, peer| peer.last_seen.elapsed() <= COLLABORATION_PEER_TTL);
+    let active = runtime.peers.keys().cloned().collect::<HashSet<_>>();
+    let host_client_id = runtime.host_client_id.clone();
+    if let Some(barrier) = runtime.playback_barrier.as_mut() {
+        barrier
+            .expected
+            .retain(|client_id| client_id == &host_client_id || active.contains(client_id));
+    }
+    let _ = complete_playback_barrier(runtime);
 }
 
 fn participant_count(runtime: &mut HostedSessionRuntime) -> usize {
@@ -865,50 +1212,19 @@ fn participant_names(runtime: &mut HostedSessionRuntime, host_name: &str) -> Vec
     names
 }
 
-fn publish_host_event(
-    session: &HostedSession,
+fn valid_transport(transport: &CollaborationTransport) -> bool {
+    transport.position.is_finite()
+        && transport.position >= 0.0
+        && transport.playback_rate.is_finite()
+        && (0.25..=4.0).contains(&transport.playback_rate)
+}
+
+fn queue_collaboration_event(
+    runtime: &mut HostedSessionRuntime,
     sender_id: String,
     kind: String,
     payload: serde_json::Value,
-) -> Result<Option<CollaborationEvent>, String> {
-    if !matches!(kind.as_str(), "transport" | "document") {
-        return Err("Unsupported collaboration event.".into());
-    }
-    let mut runtime = session
-        .runtime
-        .lock()
-        .map_err(|_| "The collaboration session is unavailable.".to_string())?;
-    if kind == "transport" {
-        let transport = serde_json::from_value::<CollaborationTransport>(payload.clone())
-            .map_err(|_| "The synchronized playback state is invalid.".to_string())?;
-        if !transport.position.is_finite()
-            || transport.position < 0.0
-            || !transport.playback_rate.is_finite()
-            || !(0.25..=4.0).contains(&transport.playback_rate)
-        {
-            return Err("The synchronized playback state is invalid.".into());
-        }
-        runtime.transport = transport;
-    } else {
-        let markdown = payload["markdown"]
-            .as_str()
-            .ok_or_else(|| "The shared Markdown update is invalid.".to_string())?;
-        if markdown.len() > 8 * 1024 * 1024 {
-            return Err("The shared Markdown update is too large.".into());
-        }
-        if markdown == runtime.markdown {
-            return Ok(None);
-        }
-        fs::write(&session.sidecar_path, markdown).map_err(|error| {
-            format!(
-                "Could not save the shared Markdown to {}: {error}",
-                session.sidecar_path.display()
-            )
-        })?;
-        runtime.markdown = markdown.to_string();
-        runtime.document_revision += 1;
-    }
-
+) -> CollaborationEvent {
     runtime.sequence += 1;
     let event = CollaborationEvent {
         sequence: runtime.sequence,
@@ -920,7 +1236,149 @@ fn publish_host_event(
     while runtime.events.len() > COLLABORATION_EVENT_LIMIT {
         runtime.events.pop_front();
     }
-    Ok(Some(event))
+    event
+}
+
+fn complete_playback_barrier(runtime: &mut HostedSessionRuntime) -> Option<CollaborationEvent> {
+    let ready = runtime
+        .playback_barrier
+        .as_ref()
+        .is_some_and(|barrier| barrier.ready.is_superset(&barrier.expected));
+    if !ready {
+        return None;
+    }
+    let barrier = runtime.playback_barrier.take()?;
+    runtime.transport = barrier.transport.clone();
+    let start_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .saturating_add(PLAYBACK_START_DELAY_MS as u128)
+        .min(u64::MAX as u128) as u64;
+    Some(queue_collaboration_event(
+        runtime,
+        "framenote-session".into(),
+        "transport-commit".into(),
+        serde_json::json!({
+            "operationId": barrier.operation_id,
+            "position": barrier.transport.position,
+            "playing": barrier.transport.playing,
+            "playbackRate": barrier.transport.playback_rate,
+            "startAtMs": start_at_ms,
+        }),
+    ))
+}
+
+fn publish_host_event(
+    session: &HostedSession,
+    sender_id: String,
+    kind: String,
+    payload: serde_json::Value,
+) -> Result<Option<CollaborationEvent>, String> {
+    if !matches!(
+        kind.as_str(),
+        "transport" | "document" | "transport-prepare" | "transport-ready"
+    ) {
+        return Err("Unsupported collaboration event.".into());
+    }
+    let mut runtime = session
+        .runtime
+        .lock()
+        .map_err(|_| "The collaboration session is unavailable.".to_string())?;
+    match kind.as_str() {
+        "transport" => {
+            let transport = serde_json::from_value::<CollaborationTransport>(payload.clone())
+                .map_err(|_| "The synchronized playback state is invalid.".to_string())?;
+            if !valid_transport(&transport) {
+                return Err("The synchronized playback state is invalid.".into());
+            }
+            // Once a prepare/ready barrier starts it owns the transport until
+            // commit. Late heartbeats and seek events from the previous state
+            // must not move or restart only a subset of participants.
+            if runtime.playback_barrier.is_some() {
+                return Ok(None);
+            }
+            runtime.transport = transport;
+        }
+        "document" => {
+            let markdown = payload["markdown"]
+                .as_str()
+                .ok_or_else(|| "The shared Markdown update is invalid.".to_string())?;
+            if markdown.len() > 8 * 1024 * 1024 {
+                return Err("The shared Markdown update is too large.".into());
+            }
+            if markdown == runtime.markdown {
+                return Ok(None);
+            }
+            fs::write(&session.sidecar_path, markdown).map_err(|error| {
+                format!(
+                    "Could not save the shared Markdown to {}: {error}",
+                    session.sidecar_path.display()
+                )
+            })?;
+            runtime.markdown = markdown.to_string();
+            runtime.document_revision += 1;
+        }
+        "transport-prepare" => {
+            let prepare = serde_json::from_value::<PlaybackPreparePayload>(payload)
+                .map_err(|_| "The playback preparation request is invalid.".to_string())?;
+            let transport = CollaborationTransport {
+                position: prepare.position,
+                playing: prepare.playing,
+                playback_rate: prepare.playback_rate,
+            };
+            if prepare.operation_id.is_empty()
+                || prepare.operation_id.len() > 80
+                || !prepare.playing
+                || !valid_transport(&transport)
+            {
+                return Err("The playback preparation request is invalid.".into());
+            }
+            prune_peers(&mut runtime);
+            let mut expected = runtime.peers.keys().cloned().collect::<HashSet<_>>();
+            expected.insert(runtime.host_client_id.clone());
+            runtime.transport = CollaborationTransport {
+                position: transport.position,
+                playing: false,
+                playback_rate: transport.playback_rate,
+            };
+            runtime.playback_barrier = Some(PlaybackBarrier {
+                operation_id: prepare.operation_id.clone(),
+                transport,
+                expected,
+                ready: HashSet::new(),
+            });
+            let normalized = serde_json::to_value(prepare)
+                .map_err(|_| "The playback preparation request is invalid.".to_string())?;
+            return Ok(Some(queue_collaboration_event(
+                &mut runtime,
+                sender_id,
+                kind,
+                normalized,
+            )));
+        }
+        "transport-ready" => {
+            let ready = serde_json::from_value::<PlaybackReadyPayload>(payload)
+                .map_err(|_| "The playback readiness response is invalid.".to_string())?;
+            if let Some(barrier) = runtime
+                .playback_barrier
+                .as_mut()
+                .filter(|barrier| barrier.operation_id == ready.operation_id)
+            {
+                if barrier.expected.contains(&sender_id) {
+                    barrier.ready.insert(sender_id);
+                }
+            }
+            return Ok(complete_playback_barrier(&mut runtime));
+        }
+        _ => unreachable!(),
+    }
+    Ok(Some(queue_collaboration_event(
+        &mut runtime,
+        sender_id,
+        kind,
+        payload,
+    )))
 }
 
 fn collaboration_session_for_token(
@@ -1074,6 +1532,11 @@ fn respond_collaboration_request(mut request: Request, hosted: &RwLock<Option<Ho
             if let Some(peer_id) = body["peerId"].as_str() {
                 if let Ok(mut runtime) = session.runtime.lock() {
                     runtime.peers.remove(peer_id);
+                    if let Some(barrier) = runtime.playback_barrier.as_mut() {
+                        barrier.expected.remove(peer_id);
+                        barrier.ready.remove(peer_id);
+                    }
+                    let _ = complete_playback_barrier(&mut runtime);
                 }
             }
             respond_json(request, 200, &serde_json::json!({ "left": true }));
@@ -1557,6 +2020,7 @@ fn host_collaboration(
     state: State<'_, AppState>,
     video_path: String,
     display_name: String,
+    initial_transport: CollaborationTransport,
 ) -> Result<CollaborationSessionInfo, String> {
     if state
         .collaboration
@@ -1602,6 +2066,9 @@ fn host_collaboration(
     .enable_addr_auto();
     let service_fullname = service_info.get_fullname().to_string();
     let host_name_label = sanitize_metadata(&display_name, "Host");
+    if !valid_transport(&initial_transport) {
+        return Err("The initial playback state is invalid.".into());
+    }
     let session = HostedSession {
         code: code.clone(),
         token,
@@ -1613,16 +2080,14 @@ fn host_collaboration(
         frame_rate: probe_frame_rate(Path::new(&video_path)),
         host_name: host_name_label,
         runtime: Arc::new(Mutex::new(HostedSessionRuntime {
+            host_client_id: state.collaboration.client_id.clone(),
             sequence: 0,
             document_revision: 0,
             markdown: markdown.clone(),
-            transport: CollaborationTransport {
-                position: playback_position(&markdown),
-                playing: false,
-                playback_rate: 1.0,
-            },
+            transport: initial_transport,
             events: VecDeque::new(),
             peers: HashMap::new(),
+            playback_barrier: None,
         })),
     };
     *state
@@ -1652,6 +2117,7 @@ async fn host_relay_session(
     relay_url: String,
     video_path: String,
     display_name: String,
+    initial_transport: CollaborationTransport,
 ) -> Result<CollaborationSessionInfo, String> {
     let relay_url = relay_url.trim().trim_end_matches('/').to_string();
     if relay_url.is_empty() {
@@ -1698,6 +2164,9 @@ async fn host_relay_session(
     let code = six_digit_session_code();
     let token = Uuid::new_v4().to_string();
     let host_name_label = sanitize_metadata(&display_name, "Host");
+    if !valid_transport(&initial_transport) {
+        return Err("The initial playback state is invalid.".into());
+    }
 
     let session = HostedSession {
         code: code.clone(),
@@ -1710,16 +2179,14 @@ async fn host_relay_session(
         frame_rate: probe_frame_rate(Path::new(&video_path)),
         host_name: host_name_label.clone(),
         runtime: Arc::new(Mutex::new(HostedSessionRuntime {
+            host_client_id: state.collaboration.client_id.clone(),
             sequence: 0,
             document_revision: 0,
             markdown: markdown.clone(),
-            transport: CollaborationTransport {
-                position: playback_position(&markdown),
-                playing: false,
-                playback_rate: 1.0,
-            },
+            transport: initial_transport,
             events: VecDeque::new(),
             peers: HashMap::new(),
+            playback_barrier: None,
         })),
     };
 
@@ -1731,10 +2198,11 @@ async fn host_relay_session(
     let register_video = video_name.clone();
 
     let ws = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
-        // Allow large messages (video chunks up to 512 MiB, single frame up to 128 MiB)
+        // Relay media is split into 2 MiB chunks; keep a small safety margin
+        // without allowing an accidental whole-video WebSocket allocation.
         let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
-        ws_config.max_message_size = Some(512 << 20); // 512 MiB
-        ws_config.max_frame_size = Some(128 << 20);   // 128 MiB
+        ws_config.max_message_size = Some(4 << 20);
+        ws_config.max_frame_size = Some(4 << 20);
         let (mut ws, _) = tungstenite::client::connect_with_config(&ws_url, Some(ws_config), 3)
             .map_err(|e| format!("Could not connect to relay ({ws_url}): {e}"))?;
 
@@ -1830,120 +2298,110 @@ async fn host_relay_session(
                             }
                         };
 
-                        match data["type"].as_str() {
-                            Some("http-request") => {
-                                let Some(id) = data["id"].as_str().map(|s| s.to_string()) else {
-                                    continue;
-                                };
-                                let method = data["method"].as_str().unwrap_or("GET").to_string();
-                                let path = data["path"].as_str().unwrap_or("/").to_string();
-                                let body_b64 = data["body"].as_str().map(|s| s.to_string());
+                        if let Some("http-request") = data["type"].as_str() {
+                            let Some(id) = data["id"].as_str().map(|s| s.to_string()) else {
+                                continue;
+                            };
+                            let method = data["method"].as_str().unwrap_or("GET").to_string();
+                            let path = data["path"].as_str().unwrap_or("/").to_string();
+                            let body_b64 = data["body"].as_str().map(|s| s.to_string());
 
-                                let local_url = format!("http://127.0.0.1:{port}{path}");
+                            let local_url = format!("http://127.0.0.1:{port}{path}");
 
-                                let mut req = http.request(
-                                    method.parse().unwrap_or(reqwest::Method::GET),
-                                    &local_url,
-                                );
+                            let mut req = http.request(
+                                method.parse().unwrap_or(reqwest::Method::GET),
+                                &local_url,
+                            );
 
-                                if let Some(headers) = data["headers"].as_object() {
-                                    for (k, v) in headers {
-                                        if let Some(v) = v.as_str() {
-                                            let lower = k.to_lowercase();
-                                            if lower != "host"
-                                                && lower != "connection"
-                                                && lower != "upgrade"
-                                            {
-                                                req = req.header(k.as_str(), v);
-                                            }
+                            if let Some(headers) = data["headers"].as_object() {
+                                for (k, v) in headers {
+                                    if let Some(v) = v.as_str() {
+                                        let lower = k.to_lowercase();
+                                        if lower != "host"
+                                            && lower != "connection"
+                                            && lower != "upgrade"
+                                        {
+                                            req = req.header(k.as_str(), v);
                                         }
-                                    }
-                                }
-
-                                let response = if let Some(b64) = &body_b64 {
-                                    if let Ok(bytes) = BASE64.decode(b64) {
-                                        req.body(bytes).send()
-                                    } else {
-                                        req.send()
-                                    }
-                                } else {
-                                    req.send()
-                                };
-
-                                match response {
-                                    Ok(resp) => {
-                                        let status = resp.status().as_u16() as u64;
-                                        let resp_headers = resp
-                                            .headers()
-                                            .iter()
-                                            .map(|(k, v)| {
-                                                (
-                                                    k.to_string(),
-                                                    serde_json::Value::String(
-                                                        v.to_str().unwrap_or("").to_string(),
-                                                    ),
-                                                )
-                                            })
-                                            .collect::<serde_json::Map<_, _>>();
-                                        let resp_body = resp.bytes().unwrap_or_default();
-
-                                        // For small bodies (< 256 KiB), send inline base64 to
-                                        // keep things simple. For large bodies (video data),
-                                        // send the body as a binary WebSocket frame to avoid
-                                        // base64 overhead and WebSocket message size limits.
-                                        if resp_body.len() > 256 * 1024 {
-                                            // Send JSON metadata first, then raw binary frame
-                                            let meta = serde_json::json!({
-                                                "type": "http-response",
-                                                "id": id,
-                                                "status": status,
-                                                "headers": resp_headers,
-                                                "bodyLength": resp_body.len(),
-                                            });
-                                            if ws
-                                                .send(Message::Text(meta.to_string().into()))
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                            if ws
-                                                .send(Message::Binary(resp_body.into()))
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                        } else {
-                                            let body_b64 = BASE64.encode(&resp_body);
-                                            let response_msg = serde_json::json!({
-                                                "type": "http-response",
-                                                "id": id,
-                                                "status": status,
-                                                "headers": resp_headers,
-                                                "body": body_b64,
-                                            });
-                                            if ws
-                                                .send(Message::Text(
-                                                    response_msg.to_string().into(),
-                                                ))
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let error_msg = serde_json::json!({
-                                            "type": "http-response",
-                                            "id": id,
-                                            "status": 502,
-                                            "headers": {},
-                                            "body": BASE64.encode(format!("Proxy error: {e}")),
-                                        });
-                                        let _ = ws.send(Message::Text(error_msg.to_string().into()));
                                     }
                                 }
                             }
-                            _ => {}
+
+                            let response = if let Some(b64) = &body_b64 {
+                                if let Ok(bytes) = BASE64.decode(b64) {
+                                    req.body(bytes).send()
+                                } else {
+                                    req.send()
+                                }
+                            } else {
+                                req.send()
+                            };
+
+                            match response {
+                                Ok(resp) => {
+                                    let status = resp.status().as_u16() as u64;
+                                    let resp_headers = resp
+                                        .headers()
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            (
+                                                k.to_string(),
+                                                serde_json::Value::String(
+                                                    v.to_str().unwrap_or("").to_string(),
+                                                ),
+                                            )
+                                        })
+                                        .collect::<serde_json::Map<_, _>>();
+                                    let resp_body = resp.bytes().unwrap_or_default();
+
+                                    // For small bodies (< 256 KiB), send inline base64 to
+                                    // keep things simple. For large bodies (video data),
+                                    // send the body as a binary WebSocket frame to avoid
+                                    // base64 overhead and WebSocket message size limits.
+                                    if resp_body.len() > 256 * 1024 {
+                                        // Send JSON metadata first, then raw binary frame
+                                        let meta = serde_json::json!({
+                                            "type": "http-response",
+                                            "id": id,
+                                            "status": status,
+                                            "headers": resp_headers,
+                                            "bodyLength": resp_body.len(),
+                                        });
+                                        if ws.send(Message::Text(meta.to_string().into())).is_err()
+                                        {
+                                            break;
+                                        }
+                                        if ws.send(Message::Binary(resp_body)).is_err() {
+                                            break;
+                                        }
+                                    } else {
+                                        let body_b64 = BASE64.encode(&resp_body);
+                                        let response_msg = serde_json::json!({
+                                            "type": "http-response",
+                                            "id": id,
+                                            "status": status,
+                                            "headers": resp_headers,
+                                            "body": body_b64,
+                                        });
+                                        if ws
+                                            .send(Message::Text(response_msg.to_string().into()))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let error_msg = serde_json::json!({
+                                        "type": "http-response",
+                                        "id": id,
+                                        "status": 502,
+                                        "headers": {},
+                                        "body": BASE64.encode(format!("Proxy error: {e}")),
+                                    });
+                                    let _ = ws.send(Message::Text(error_msg.to_string().into()));
+                                }
+                            }
                         }
                     }
                     Message::Ping(data) => {
@@ -1969,11 +2427,10 @@ async fn host_relay_session(
         .collaboration
         .relay
         .write()
-        .map_err(|_| "The collaboration state is unavailable.".to_string())? =
-        Some(RelayState {
-            url: relay_url_store,
-            disconnect,
-        });
+        .map_err(|_| "The collaboration state is unavailable.".to_string())? = Some(RelayState {
+        url: relay_url_store,
+        disconnect,
+    });
 
     Ok(hosted_session_info(&state.collaboration, &session))
 }
@@ -2102,10 +2559,13 @@ async fn join_collaboration(
         .map_err(|_| "The private media server is unavailable.".to_string())?
         .insert(
             media_token.clone(),
-            MediaSource::Remote(RemoteMediaSource {
+            MediaSource::CachedRemote(CachedRemoteMediaSource {
                 media_url: format!("{host_base_url}/session/{}/media", network.token),
                 mix_url: format!("{host_base_url}/session/{}/mix", network.token),
                 content_type: media_content_type(Path::new(&network.video_name)).into(),
+                cache_path: shadow_video_path.clone(),
+                cache_state: Default::default(),
+                fetch_lock: Default::default(),
             }),
         );
     let joined = JoinedSession {
@@ -2215,9 +2675,7 @@ async fn join_relay_session(
                 "displayName": join_display_name,
             }))
             .send()
-            .map_err(|e| {
-                format!("Could not reach the relay server ({join_http_base}): {e}")
-            })?;
+            .map_err(|e| format!("Could not reach the relay server ({join_http_base}): {e}"))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -2257,10 +2715,13 @@ async fn join_relay_session(
         .map_err(|_| "The private media server is unavailable.".to_string())?
         .insert(
             media_token.clone(),
-            MediaSource::Remote(RemoteMediaSource {
+            MediaSource::CachedRemote(CachedRemoteMediaSource {
                 media_url: format!("{http_base}/session/{}/media", network.token),
                 mix_url: format!("{http_base}/session/{}/mix", network.token),
                 content_type: media_content_type(Path::new(&network.video_name)).into(),
+                cache_path: shadow_video_path.clone(),
+                cache_state: Default::default(),
+                fetch_lock: Default::default(),
             }),
         );
     let joined = JoinedSession {
@@ -2414,10 +2875,7 @@ fn publish_collaboration_event_service(
         .map_err(|_| "The collaboration state is unavailable.".to_string())?
         .clone()
         .ok_or_else(|| "No shared session is active.".to_string())?;
-    let event_url = format!(
-        "{}/session/{}/event",
-        joined.host_base_url, joined.token
-    );
+    let event_url = format!("{}/session/{}/event", joined.host_base_url, joined.token);
     let response = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
@@ -4593,6 +5051,7 @@ mod tests {
             frame_rate: Some(30.0),
             host_name: "Host".into(),
             runtime: Arc::new(Mutex::new(HostedSessionRuntime {
+                host_client_id: "host-one".into(),
                 sequence: 0,
                 document_revision: 0,
                 markdown,
@@ -4603,6 +5062,7 @@ mod tests {
                 },
                 events: VecDeque::new(),
                 peers: HashMap::new(),
+                playback_barrier: None,
             })),
         }
     }
@@ -5118,6 +5578,286 @@ mod tests {
         assert!(runtime.transport.playing);
         drop(runtime);
         let _ = service.mdns.shutdown();
+    }
+
+    #[test]
+    fn local_media_preserves_total_size_and_caps_only_range_responses() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let video = folder.path().join("large.mp4");
+        let bytes = vec![0x5a; MAX_VIDEO_CHUNK as usize + 37];
+        fs::write(&video, &bytes).expect("large media fixture");
+        let media = start_media_server().expect("media server");
+        media
+            .files
+            .write()
+            .expect("media registry")
+            .insert("large".into(), MediaSource::Local(video));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let url = format!("{}/media/large", media.base_url);
+
+        let head = client.head(&url).send().expect("head response");
+        assert_eq!(head.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            head.headers()[reqwest::header::CONTENT_LENGTH],
+            bytes.len().to_string()
+        );
+
+        let partial = client
+            .get(&url)
+            .header("Range", "bytes=0-")
+            .send()
+            .expect("range response");
+        assert_eq!(partial.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial.headers()[reqwest::header::CONTENT_RANGE],
+            format!(
+                "bytes 0-{}/{byte_count}",
+                MAX_VIDEO_CHUNK - 1,
+                byte_count = bytes.len()
+            )
+        );
+        assert_eq!(
+            partial.bytes().expect("range body").len(),
+            MAX_VIDEO_CHUNK as usize
+        );
+    }
+
+    #[test]
+    fn remote_media_cache_reuses_exact_fetched_ranges() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let service = start_collaboration_service().expect("peer service");
+        let session = collaboration_fixture(&folder, "420732");
+        let bytes = vec![0x6b; MAX_VIDEO_CHUNK as usize + 41];
+        fs::write(&session.video_path, &bytes).expect("remote media fixture");
+        *service.hosted.write().expect("hosted session") = Some(session.clone());
+        let proxy = start_media_server().expect("proxy media server");
+        let cache_path = folder.path().join("remote-cache.mp4");
+        proxy.files.write().expect("proxy registry").insert(
+            "remote".into(),
+            MediaSource::CachedRemote(CachedRemoteMediaSource {
+                media_url: format!(
+                    "http://127.0.0.1:{}/session/{}/media",
+                    service.port, session.token
+                ),
+                mix_url: String::new(),
+                content_type: "video/mp4".into(),
+                cache_path,
+                cache_state: Default::default(),
+                fetch_lock: Default::default(),
+            }),
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let url = format!("{}/media/remote", proxy.base_url);
+        let head = client.head(&url).send().expect("remote head response");
+        assert_eq!(
+            head.headers()[reqwest::header::CONTENT_LENGTH],
+            bytes.len().to_string()
+        );
+        let first = client
+            .get(&url)
+            .header("Range", format!("bytes=0-{}", MAX_VIDEO_CHUNK - 1))
+            .send()
+            .expect("initial proxy response");
+        assert_eq!(first.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            first.bytes().expect("initial proxy body").len(),
+            MAX_VIDEO_CHUNK as usize
+        );
+
+        *service.hosted.write().expect("remove host") = None;
+        let cached = client
+            .get(&url)
+            .header("Range", "bytes=256-767")
+            .send()
+            .expect("cached response");
+        assert_eq!(cached.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            cached.bytes().expect("cached body").as_ref(),
+            &bytes[256..768]
+        );
+        let _ = service.mdns.shutdown();
+    }
+
+    #[test]
+    fn ffprobe_reads_a_real_mp4_through_the_bounded_remote_proxy() {
+        let (Some(ffmpeg), Some(ffprobe)) = (find_executable("ffmpeg"), find_executable("ffprobe"))
+        else {
+            return;
+        };
+        let folder = tempfile::tempdir().expect("temp folder");
+        let video = folder.path().join("relay-fixture.mp4");
+        let status = StdCommand::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=30:duration=8",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=8",
+                "-c:v",
+                "mpeg4",
+                "-q:v",
+                "2",
+                "-c:a",
+                "aac",
+                "-y",
+            ])
+            .arg(&video)
+            .status()
+            .expect("create MP4 fixture");
+        assert!(status.success());
+        assert!(fs::metadata(&video).expect("fixture metadata").len() > MAX_VIDEO_CHUNK);
+
+        let service = start_collaboration_service().expect("peer service");
+        let mut session = collaboration_fixture(&folder, "420734");
+        session.video_path = video;
+        *service.hosted.write().expect("hosted session") = Some(session.clone());
+        let proxy = start_media_server().expect("proxy media server");
+        proxy.files.write().expect("proxy registry").insert(
+            "real-mp4".into(),
+            MediaSource::CachedRemote(CachedRemoteMediaSource {
+                media_url: format!(
+                    "http://127.0.0.1:{}/session/{}/media",
+                    service.port, session.token
+                ),
+                mix_url: String::new(),
+                content_type: "video/mp4".into(),
+                cache_path: folder.path().join("real-mp4-cache.mp4"),
+                cache_state: Default::default(),
+                fetch_lock: Default::default(),
+            }),
+        );
+        let output = StdCommand::new(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(format!("{}/media/real-mp4", proxy.base_url))
+            .output()
+            .expect("probe relayed MP4");
+        assert!(
+            output.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let duration = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<f64>()
+            .expect("duration");
+        assert!(
+            (duration - 8.0).abs() < 0.1,
+            "unexpected duration: {duration}"
+        );
+        let _ = service.mdns.shutdown();
+    }
+
+    #[test]
+    fn playback_barrier_waits_for_host_and_every_active_guest() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let session = collaboration_fixture(&folder, "420733");
+        {
+            let mut runtime = session.runtime.lock().expect("runtime");
+            runtime.peers.insert(
+                "guest-one".into(),
+                PeerPresence {
+                    name: "One".into(),
+                    last_seen: Instant::now(),
+                },
+            );
+            runtime.peers.insert(
+                "guest-two".into(),
+                PeerPresence {
+                    name: "Two".into(),
+                    last_seen: Instant::now(),
+                },
+            );
+        }
+        publish_host_event(
+            &session,
+            "host-one".into(),
+            "transport-prepare".into(),
+            serde_json::json!({
+                "operationId": "play-one",
+                "position": 42.5,
+                "playing": true,
+                "playbackRate": 1.0
+            }),
+        )
+        .expect("prepare playback")
+        .expect("prepare event");
+        assert!(!session.runtime.lock().expect("runtime").transport.playing);
+
+        assert!(publish_host_event(
+            &session,
+            "guest-one".into(),
+            "transport".into(),
+            serde_json::json!({
+                "position": 91.0,
+                "playing": true,
+                "playbackRate": 1.0
+            }),
+        )
+        .expect("late transport heartbeat")
+        .is_none());
+        {
+            let runtime = session.runtime.lock().expect("runtime");
+            assert_eq!(runtime.transport.position, 42.5);
+            assert!(!runtime.transport.playing);
+        }
+
+        for client_id in ["host-one", "guest-one"] {
+            assert!(publish_host_event(
+                &session,
+                client_id.into(),
+                "transport-ready".into(),
+                serde_json::json!({ "operationId": "play-one" }),
+            )
+            .expect("ready response")
+            .is_none());
+            assert!(!session.runtime.lock().expect("runtime").transport.playing);
+        }
+        let commit = publish_host_event(
+            &session,
+            "guest-two".into(),
+            "transport-ready".into(),
+            serde_json::json!({ "operationId": "play-one" }),
+        )
+        .expect("final ready")
+        .expect("commit event");
+        assert_eq!(commit.kind, "transport-commit");
+        assert_eq!(commit.payload["position"], 42.5);
+        assert!(commit.payload["startAtMs"].as_u64().is_some());
+        assert!(session.runtime.lock().expect("runtime").transport.playing);
+
+        let pause = publish_host_event(
+            &session,
+            "host-one".into(),
+            "transport".into(),
+            serde_json::json!({
+                "position": 42.6,
+                "playing": false,
+                "playbackRate": 1.0
+            }),
+        )
+        .expect("immediate pause")
+        .expect("pause event");
+        assert_eq!(pause.kind, "transport");
+        assert!(!session.runtime.lock().expect("runtime").transport.playing);
     }
 
     #[test]

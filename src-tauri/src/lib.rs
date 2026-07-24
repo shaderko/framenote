@@ -34,7 +34,7 @@ const EMBEDDED_CHAPTER_MARKER: &str = "<!-- framenote:embedded-chapters fingerpr
 const COLLABORATION_SERVICE_TYPE: &str = "_framenote._tcp.local.";
 const COLLABORATION_EVENT_LIMIT: usize = 1024;
 const COLLABORATION_PEER_TTL: Duration = Duration::from_secs(12);
-const PLAYBACK_START_DELAY_MS: u64 = 1_500;
+const PLAYBACK_START_DELAY_MS: u64 = 3_000;
 
 struct AppState {
     jobs: Mutex<HashMap<String, CancellationToken>>,
@@ -72,6 +72,8 @@ struct CachedRemoteMediaSource {
     cache_path: PathBuf,
     cache_state: Arc<Mutex<RemoteMediaCacheState>>,
     fetch_lock: Arc<Mutex<()>>,
+    client: reqwest::blocking::Client,
+    prefetching: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -213,6 +215,8 @@ struct CollaborationPollResult {
     participant_count: usize,
     participants: Vec<String>,
     connected: bool,
+    #[serde(default)]
+    server_time_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -515,12 +519,12 @@ fn requested_range(request: &Request, size: u64) -> Option<(u64, u64)> {
     (start < size && start <= end).then_some((start, end))
 }
 
-/// Maximum bytes to serve in a single video chunk. The browser will make
-/// additional range requests for the rest — each chunk stays small enough
-/// to tunnel through the relay without timeouts or memory issues.
-const MAX_VIDEO_CHUNK: u64 = 2 * 1024 * 1024; // 2 MiB
+/// Maximum bytes to serve in a shared video chunk. Local playback is never
+/// capped; only network-facing session responses use this bound.
+const MAX_VIDEO_CHUNK: u64 = 512 * 1024; // 512 KiB keeps relay control traffic responsive.
+const REMOTE_PREFETCH_CHUNKS: usize = 2;
 
-fn respond_local_media(request: Request, path: &Path) {
+fn respond_local_media(request: Request, path: &Path, max_range_length: Option<u64>) {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let _ = request.respond(Response::empty(StatusCode(405)));
         return;
@@ -553,11 +557,13 @@ fn respond_local_media(request: Request, path: &Path) {
         Some((start, end)) => (start, end, StatusCode(206)),
         None => (0, size - 1, StatusCode(200)),
     };
-    // Only cap actual range responses. Capping a plain 200/HEAD would falsely
-    // tell the browser that a large MP4 is only one chunk long, preventing it
-    // from finding metadata stored near the end of the file.
-    if status == StatusCode(206) && end - start + 1 > MAX_VIDEO_CHUNK {
-        end = start + MAX_VIDEO_CHUNK - 1;
+    // Shared responses stay bounded for the relay. The desktop webview must
+    // receive its requested local range exactly; otherwise WebKit can stop
+    // after the artificial range end instead of requesting the next piece.
+    if let Some(limit) = max_range_length.filter(|limit| *limit > 0) {
+        if status == StatusCode(206) && end - start + 1 > limit {
+            end = start.saturating_add(limit - 1).min(end);
+        }
     }
     let length = end - start + 1;
     let mut headers = vec![
@@ -734,7 +740,20 @@ fn ensure_remote_media_size(source: &CachedRemoteMediaSource) -> Result<u64, Str
     {
         return Ok(total);
     }
-    let response = remote_media_client()?
+    let _fetch_guard = source
+        .fetch_lock
+        .lock()
+        .map_err(|_| "The shared media cache is unavailable.".to_string())?;
+    if let Some(total) = source
+        .cache_state
+        .lock()
+        .ok()
+        .and_then(|state| state.total_size)
+    {
+        return Ok(total);
+    }
+    let response = source
+        .client
         .head(&source.media_url)
         .send()
         .map_err(|error| format!("The sharing peer is unavailable: {error}"))?;
@@ -778,7 +797,8 @@ fn fetch_remote_media_chunk(
     let requested_end = fetch_start
         .saturating_add(MAX_VIDEO_CHUNK - 1)
         .min(total.saturating_sub(1));
-    let response = remote_media_client()?
+    let response = source
+        .client
         .get(&source.media_url)
         .header(
             reqwest::header::RANGE,
@@ -829,6 +849,31 @@ fn fetch_remote_media_chunk(
         .ok_or_else(|| "The shared media cache did not contain the requested byte.".to_string())
 }
 
+fn schedule_remote_media_prefetch(source: &CachedRemoteMediaSource, start: u64, total: u64) {
+    if start >= total
+        || source
+            .prefetching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    let source = source.clone();
+    thread::spawn(move || {
+        let mut position = start;
+        for _ in 0..REMOTE_PREFETCH_CHUNKS {
+            if position >= total {
+                break;
+            }
+            match fetch_remote_media_chunk(&source, position, total) {
+                Ok(end) => position = end.saturating_add(1),
+                Err(_) => break,
+            }
+        }
+        source.prefetching.store(false, Ordering::Release);
+    });
+}
+
 struct RemoteMediaReader {
     source: CachedRemoteMediaSource,
     position: u64,
@@ -861,6 +906,7 @@ impl RemoteMediaReader {
         file.seek(SeekFrom::Start(self.position))?;
         self.file = Some(file);
         self.available_end = available_end.min(self.end);
+        schedule_remote_media_prefetch(&self.source, available_end.saturating_add(1), self.total);
         Ok(())
     }
 }
@@ -972,7 +1018,7 @@ fn respond_media(request: Request, files: &RwLock<HashMap<String, MediaSource>>)
         return;
     };
     match source {
-        MediaSource::Local(path) => respond_local_media(request, &path),
+        MediaSource::Local(path) => respond_local_media(request, &path, None),
         MediaSource::CachedRemote(remote) => respond_cached_remote_proxy(request, &remote),
     }
 }
@@ -1219,6 +1265,14 @@ fn valid_transport(transport: &CollaborationTransport) -> bool {
         && (0.25..=4.0).contains(&transport.playback_rate)
 }
 
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 fn queue_collaboration_event(
     runtime: &mut HostedSessionRuntime,
     sender_id: String,
@@ -1249,10 +1303,7 @@ fn complete_playback_barrier(runtime: &mut HostedSessionRuntime) -> Option<Colla
     }
     let barrier = runtime.playback_barrier.take()?;
     runtime.transport = barrier.transport.clone();
-    let start_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+    let start_at_ms = u128::from(unix_time_ms())
         .saturating_add(PLAYBACK_START_DELAY_MS as u128)
         .min(u64::MAX as u128) as u64;
     Some(queue_collaboration_event(
@@ -1298,7 +1349,18 @@ fn publish_host_event(
             if runtime.playback_barrier.is_some() {
                 return Ok(None);
             }
-            runtime.transport = transport;
+            runtime.transport = transport.clone();
+            return Ok(Some(queue_collaboration_event(
+                &mut runtime,
+                sender_id,
+                kind,
+                serde_json::json!({
+                    "position": transport.position,
+                    "playing": transport.playing,
+                    "playbackRate": transport.playback_rate,
+                    "serverEmittedAtMs": unix_time_ms(),
+                }),
+            )));
         }
         "document" => {
             let markdown = payload["markdown"]
@@ -1464,7 +1526,7 @@ fn respond_collaboration_request(mut request: Request, hosted: &RwLock<Option<Ho
         return;
     };
     match segments[2] {
-        "media" => respond_local_media(request, &session.video_path),
+        "media" => respond_local_media(request, &session.video_path, Some(MAX_VIDEO_CHUNK)),
         "mix" => respond_audio_mix_for_path(request, &session.video_path),
         "events" if request.method() == &Method::Get => {
             let query = parsed.query_pairs().collect::<HashMap<_, _>>();
@@ -1506,6 +1568,7 @@ fn respond_collaboration_request(mut request: Request, hosted: &RwLock<Option<Ho
                     participant_count: count,
                     participants,
                     connected: true,
+                    server_time_ms: unix_time_ms(),
                 },
             );
         }
@@ -2566,6 +2629,8 @@ async fn join_collaboration(
                 cache_path: shadow_video_path.clone(),
                 cache_state: Default::default(),
                 fetch_lock: Default::default(),
+                client: remote_media_client()?,
+                prefetching: Default::default(),
             }),
         );
     let joined = JoinedSession {
@@ -2722,6 +2787,8 @@ async fn join_relay_session(
                 cache_path: shadow_video_path.clone(),
                 cache_state: Default::default(),
                 fetch_lock: Default::default(),
+                client: remote_media_client()?,
+                prefetching: Default::default(),
             }),
         );
     let joined = JoinedSession {
@@ -2801,6 +2868,7 @@ fn poll_collaboration_service(
             participant_count: count,
             participants,
             connected: true,
+            server_time_ms: unix_time_ms(),
         });
     }
     let joined = service
@@ -5567,8 +5635,12 @@ mod tests {
             .json::<CollaborationPollResult>()
             .expect("poll response");
         assert_eq!(poll.participant_count, 2);
+        assert!(poll.server_time_ms > 0);
         assert_eq!(poll.events.len(), 2);
         assert_eq!(poll.events[0].kind, "transport");
+        assert!(poll.events[0].payload["serverEmittedAtMs"]
+            .as_u64()
+            .is_some());
         assert_eq!(poll.events[1].kind, "document");
         assert!(fs::read_to_string(&session.sidecar_path)
             .expect("canonical sidecar")
@@ -5581,7 +5653,7 @@ mod tests {
     }
 
     #[test]
-    fn local_media_preserves_total_size_and_caps_only_range_responses() {
+    fn local_media_preserves_the_complete_requested_range() {
         let folder = tempfile::tempdir().expect("temp folder");
         let video = folder.path().join("large.mp4");
         let bytes = vec![0x5a; MAX_VIDEO_CHUNK as usize + 37];
@@ -5614,15 +5686,47 @@ mod tests {
         assert_eq!(
             partial.headers()[reqwest::header::CONTENT_RANGE],
             format!(
-                "bytes 0-{}/{byte_count}",
+                "bytes 0-{end}/{total}",
+                end = bytes.len() - 1,
+                total = bytes.len()
+            )
+        );
+        assert_eq!(partial.bytes().expect("range body").len(), bytes.len());
+    }
+
+    #[test]
+    fn shared_media_keeps_open_ended_ranges_bounded() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let service = start_collaboration_service().expect("peer service");
+        let session = collaboration_fixture(&folder, "420735");
+        let bytes = vec![0x5c; MAX_VIDEO_CHUNK as usize + 37];
+        fs::write(&session.video_path, &bytes).expect("shared media fixture");
+        *service.hosted.write().expect("hosted session") = Some(session.clone());
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client")
+            .get(format!(
+                "http://127.0.0.1:{}/session/{}/media",
+                service.port, session.token
+            ))
+            .header("Range", "bytes=0-")
+            .send()
+            .expect("shared range response");
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[reqwest::header::CONTENT_RANGE],
+            format!(
+                "bytes 0-{}/{total}",
                 MAX_VIDEO_CHUNK - 1,
-                byte_count = bytes.len()
+                total = bytes.len()
             )
         );
         assert_eq!(
-            partial.bytes().expect("range body").len(),
+            response.bytes().expect("shared range body").len(),
             MAX_VIDEO_CHUNK as usize
         );
+        let _ = service.mdns.shutdown();
     }
 
     #[test]
@@ -5647,6 +5751,8 @@ mod tests {
                 cache_path,
                 cache_state: Default::default(),
                 fetch_lock: Default::default(),
+                client: remote_media_client().expect("remote media client"),
+                prefetching: Default::default(),
             }),
         );
         let client = reqwest::blocking::Client::builder()
@@ -5681,6 +5787,70 @@ mod tests {
             cached.bytes().expect("cached body").as_ref(),
             &bytes[256..768]
         );
+        let _ = service.mdns.shutdown();
+    }
+
+    #[test]
+    fn remote_media_cache_prefetches_the_next_two_chunks() {
+        let folder = tempfile::tempdir().expect("temp folder");
+        let service = start_collaboration_service().expect("peer service");
+        let session = collaboration_fixture(&folder, "420736");
+        let bytes = vec![0x6d; MAX_VIDEO_CHUNK as usize * 3 + 41];
+        fs::write(&session.video_path, &bytes).expect("remote media fixture");
+        *service.hosted.write().expect("hosted session") = Some(session.clone());
+        let proxy = start_media_server().expect("proxy media server");
+        let source = CachedRemoteMediaSource {
+            media_url: format!(
+                "http://127.0.0.1:{}/session/{}/media",
+                service.port, session.token
+            ),
+            mix_url: String::new(),
+            content_type: "video/mp4".into(),
+            cache_path: folder.path().join("prefetched-cache.mp4"),
+            cache_state: Default::default(),
+            fetch_lock: Default::default(),
+            client: remote_media_client().expect("remote media client"),
+            prefetching: Default::default(),
+        };
+        proxy.files.write().expect("proxy registry").insert(
+            "prefetched".into(),
+            MediaSource::CachedRemote(source.clone()),
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let url = format!("{}/media/prefetched", proxy.base_url);
+        let first = client
+            .get(&url)
+            .header("Range", "bytes=0-1023")
+            .send()
+            .expect("initial proxy response");
+        assert_eq!(first.bytes().expect("initial body").len(), 1024);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while cached_range_end(&source, MAX_VIDEO_CHUNK * 2).is_none() && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let cached_end = cached_range_end(&source, MAX_VIDEO_CHUNK * 2)
+            .expect("two chunks should be prefetched after the active chunk");
+        assert!(cached_end >= MAX_VIDEO_CHUNK * 3 - 1);
+
+        *service.hosted.write().expect("remove host") = None;
+        let cached = client
+            .get(&url)
+            .header(
+                "Range",
+                format!(
+                    "bytes={}-{}",
+                    MAX_VIDEO_CHUNK * 2,
+                    MAX_VIDEO_CHUNK * 2 + 1023
+                ),
+            )
+            .send()
+            .expect("prefetched response");
+        assert_eq!(cached.bytes().expect("prefetched body").len(), 1024);
         let _ = service.mdns.shutdown();
     }
 
@@ -5736,6 +5906,8 @@ mod tests {
                 cache_path: folder.path().join("real-mp4-cache.mp4"),
                 cache_state: Default::default(),
                 fetch_lock: Default::default(),
+                client: remote_media_client().expect("remote media client"),
+                prefetching: Default::default(),
             }),
         );
         let output = StdCommand::new(ffprobe)
@@ -5857,6 +6029,7 @@ mod tests {
         .expect("immediate pause")
         .expect("pause event");
         assert_eq!(pause.kind, "transport");
+        assert!(pause.payload["serverEmittedAtMs"].as_u64().is_some());
         assert!(!session.runtime.lock().expect("runtime").transport.playing);
     }
 

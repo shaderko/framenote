@@ -100,7 +100,7 @@ interface CollaborationTransport {
   position: number;
   playing: boolean;
   playbackRate: number;
-  emittedAt?: number;
+  serverEmittedAtMs?: number;
 }
 
 interface CollaborationEvent {
@@ -115,6 +115,7 @@ interface CollaborationPollResult {
   participantCount: number;
   participants: string[];
   connected: boolean;
+  serverTimeMs?: number;
 }
 
 interface PlaybackPrepare {
@@ -156,11 +157,16 @@ interface SubtitleTimingOverride {
   end: number;
 }
 
+const PLAYBACK_BUFFER_AHEAD_SECONDS = 3;
+
 function hasPlaybackBuffer(video: HTMLVideoElement, time: number) {
   if (video.seeking || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
-  const requiredEnd = Math.min(Number.isFinite(video.duration) ? video.duration : time + 0.2, time + 0.2);
+  const requiredEnd = Math.min(
+    Number.isFinite(video.duration) ? video.duration : time + PLAYBACK_BUFFER_AHEAD_SECONDS,
+    time + PLAYBACK_BUFFER_AHEAD_SECONDS,
+  );
   for (let index = 0; index < video.buffered.length; index += 1) {
-    if (video.buffered.start(index) <= time + 0.05 && video.buffered.end(index) >= requiredEnd) return true;
+    if (video.buffered.start(index) <= time + 0.12 && video.buffered.end(index) >= requiredEnd - 0.05) return true;
   }
   return video.buffered.length === 0 && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
 }
@@ -391,7 +397,11 @@ function App() {
   const playbackOperationPhaseRef = useRef<"preparing" | "committed" | null>(null);
   const handledPlaybackPrepareRef = useRef(new Set<string>());
   const playbackCommitTimerRef = useRef<number | null>(null);
+  const playbackReadyTimerRef = useRef<number | null>(null);
   const seekSyncTimerRef = useRef<number | null>(null);
+  const serverClockOffsetRef = useRef(0);
+  const serverClockBestRttRef = useRef(Number.POSITIVE_INFINITY);
+  const lastRebufferRequestRef = useRef(0);
 
   const [document, setDocument] = useState<SidecarDocument | null>(() =>
     IS_DEMO
@@ -916,7 +926,7 @@ function App() {
     try {
       const video = videoRef.current;
       const initialPosition = Math.max(0, video?.currentTime ?? currentTimeRef.current);
-      const initialPlaybackRate = video?.playbackRate ?? playbackRate;
+      const initialPlaybackRate = playbackRate;
       const initialPlaying = video ? !video.paused : false;
       let session: CollaborationSession;
       if (shareMode === "internet") {
@@ -1035,6 +1045,10 @@ function App() {
         window.clearTimeout(playbackCommitTimerRef.current);
         playbackCommitTimerRef.current = null;
       }
+      if (playbackReadyTimerRef.current) {
+        window.clearTimeout(playbackReadyTimerRef.current);
+        playbackReadyTimerRef.current = null;
+      }
       if (seekSyncTimerRef.current) {
         window.clearTimeout(seekSyncTimerRef.current);
         seekSyncTimerRef.current = null;
@@ -1067,25 +1081,32 @@ function App() {
     const payload: CollaborationTransport = {
       position: Math.max(0, transport?.position ?? video.currentTime),
       playing: transport?.playing ?? !video.paused,
-      playbackRate: transport?.playbackRate ?? video.playbackRate,
-      emittedAt: Date.now(),
+      playbackRate: transport?.playbackRate ?? playbackRate,
     };
     void invoke("publish_collaboration_event", { kind: "transport", payload })
       .catch(() => setCollaborationPhase("reconnecting"));
-  }, [collaboration]);
+  }, [collaboration, playbackRate]);
 
-  const requestSynchronizedPlayback = useCallback((position: number, playbackRate?: number) => {
+  const requestSynchronizedPlayback = useCallback((position: number, requestedPlaybackRate?: number) => {
     const video = videoRef.current;
     if (!collaboration || !video) return;
     if (playbackCommitTimerRef.current) {
       window.clearTimeout(playbackCommitTimerRef.current);
       playbackCommitTimerRef.current = null;
     }
+    if (playbackReadyTimerRef.current) {
+      window.clearTimeout(playbackReadyTimerRef.current);
+      playbackReadyTimerRef.current = null;
+    }
     const operationId = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `${collaboration.clientId}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     activePlaybackOperationRef.current = operationId;
     playbackOperationPhaseRef.current = "preparing";
+    if (!video.paused) {
+      remotePauseEventRef.current = true;
+      video.pause();
+    }
     setPlaybackSyncStatus("Preparing everyone…");
     void invoke("publish_collaboration_event", {
       kind: "transport-prepare",
@@ -1093,7 +1114,7 @@ function App() {
         operationId,
         position: Math.max(0, position),
         playing: true,
-        playbackRate: playbackRate ?? video.playbackRate,
+        playbackRate: requestedPlaybackRate ?? playbackRate,
       },
     }).catch((error) => {
       if (activePlaybackOperationRef.current === operationId) {
@@ -1104,7 +1125,7 @@ function App() {
       setCollaborationPhase("reconnecting");
       showNotice(errorMessage(error), "error");
     });
-  }, [collaboration, showNotice]);
+  }, [collaboration, playbackRate, showNotice]);
 
   const prepareSynchronizedPlayback = useCallback(async (prepare: PlaybackPrepare) => {
     if (!collaboration || !prepare.operationId || handledPlaybackPrepareRef.current.has(prepare.operationId)) return;
@@ -1120,6 +1141,10 @@ function App() {
       window.clearTimeout(playbackCommitTimerRef.current);
       playbackCommitTimerRef.current = null;
     }
+    if (playbackReadyTimerRef.current) {
+      window.clearTimeout(playbackReadyTimerRef.current);
+      playbackReadyTimerRef.current = null;
+    }
     const video = videoRef.current;
     if (!video) return;
     remoteTransportUntilRef.current = Date.now() + 25_000;
@@ -1131,21 +1156,35 @@ function App() {
     currentTimeRef.current = position;
     setCurrentTime(position);
     setPlaybackSyncStatus("Buffering for everyone…");
-    const ready = await waitForPlaybackBuffer(video, position);
-    if (activePlaybackOperationRef.current !== prepare.operationId) return;
-    if (!ready) {
-      setPlaybackSyncStatus("Waiting for media…");
-      showNotice("Playback is waiting because this video position has not buffered yet.", "error");
-      return;
+    let ready = false;
+    let reportedSlowBuffer = false;
+    while (activePlaybackOperationRef.current === prepare.operationId && !ready) {
+      ready = await waitForPlaybackBuffer(video, position);
+      if (!ready && activePlaybackOperationRef.current === prepare.operationId) {
+        setPlaybackSyncStatus("Waiting for media…");
+        if (!reportedSlowBuffer) {
+          reportedSlowBuffer = true;
+          showNotice("Playback is waiting for this position to buffer.", "error");
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 750));
+      }
     }
+    if (activePlaybackOperationRef.current !== prepare.operationId) return;
     setPlaybackSyncStatus("Waiting for everyone…");
-    void invoke("publish_collaboration_event", {
-      kind: "transport-ready",
-      payload: { operationId: prepare.operationId },
-    }).catch((error) => {
-      setCollaborationPhase("reconnecting");
-      showNotice(errorMessage(error), "error");
-    });
+    const announceReady = () => {
+      if (activePlaybackOperationRef.current !== prepare.operationId || playbackOperationPhaseRef.current !== "preparing") return;
+      void invoke("publish_collaboration_event", {
+        kind: "transport-ready",
+        payload: { operationId: prepare.operationId },
+      }).catch(() => {
+        setCollaborationPhase("reconnecting");
+      }).finally(() => {
+        if (activePlaybackOperationRef.current === prepare.operationId && playbackOperationPhaseRef.current === "preparing") {
+          playbackReadyTimerRef.current = window.setTimeout(announceReady, 700);
+        }
+      });
+    };
+    announceReady();
   }, [collaboration, showNotice]);
 
   const applyPlaybackCommit = useCallback((payload: Record<string, unknown>) => {
@@ -1157,14 +1196,29 @@ function App() {
     if (activePlaybackOperationRef.current && activePlaybackOperationRef.current !== operationId) return;
     activePlaybackOperationRef.current = operationId;
     playbackOperationPhaseRef.current = "committed";
+    if (playbackReadyTimerRef.current) {
+      window.clearTimeout(playbackReadyTimerRef.current);
+      playbackReadyTimerRef.current = null;
+    }
     const video = videoRef.current;
     if (!video) return;
     if (playbackCommitTimerRef.current) window.clearTimeout(playbackCommitTimerRef.current);
-    const delay = Math.max(0, startAtMs - Date.now());
+    const estimatedServerNow = Date.now() + serverClockOffsetRef.current;
+    const lateByMs = estimatedServerNow - startAtMs;
+    if (lateByMs > 250) {
+      const catchUpPosition = Math.max(0, Math.min(
+        video.duration || Number.POSITIVE_INFINITY,
+        position + (lateByMs / 1_000) * playbackRate,
+      ));
+      requestSynchronizedPlayback(catchUpPosition, playbackRate);
+      return;
+    }
+    const delay = Math.max(0, startAtMs - estimatedServerNow);
     remoteTransportUntilRef.current = Date.now() + delay + 2_500;
     video.playbackRate = playbackRate;
     setPlaybackRate(playbackRate);
-    video.currentTime = Math.max(0, Math.min(video.duration || Number.POSITIVE_INFINITY, position));
+    const commitPosition = Math.max(0, Math.min(video.duration || Number.POSITIVE_INFINITY, position));
+    if (Math.abs(video.currentTime - commitPosition) > 0.025) video.currentTime = commitPosition;
     currentTimeRef.current = video.currentTime;
     setCurrentTime(video.currentTime);
     setPlaybackSyncStatus("Starting together…");
@@ -1179,10 +1233,11 @@ function App() {
         playbackOperationPhaseRef.current = null;
         remoteTransportUntilRef.current = 0;
         setPlaybackSyncStatus(null);
+        publishTransport({ position: currentVideo.currentTime, playing: false, playbackRate });
         showNotice("Click the player once to allow synchronized playback.", "error");
       });
     }, delay);
-  }, [showNotice]);
+  }, [publishTransport, requestSynchronizedPlayback, showNotice]);
 
   useEffect(() => {
     if (!collaboration || !document || !IS_TAURI) return;
@@ -1203,13 +1258,31 @@ function App() {
   }, [collaboration, document, showNotice]);
 
   useEffect(() => {
+    serverClockOffsetRef.current = 0;
+    serverClockBestRttRef.current = Number.POSITIVE_INFINITY;
+  }, [collaboration?.code, collaboration?.mode]);
+
+  useEffect(() => {
     if (!collaboration || !IS_TAURI) return;
     let cancelled = false;
     let timer: number | undefined;
     const poll = async () => {
+      const pollStartedAt = Date.now();
       try {
         const result = await invoke<CollaborationPollResult>("poll_collaboration");
         if (cancelled) return;
+        const pollReceivedAt = Date.now();
+        const serverTimeMs = Number(result.serverTimeMs);
+        if (Number.isFinite(serverTimeMs) && serverTimeMs > 0) {
+          const roundTrip = Math.max(0, pollReceivedAt - pollStartedAt);
+          const offsetSample = serverTimeMs - (pollStartedAt + pollReceivedAt) / 2;
+          if (!Number.isFinite(serverClockBestRttRef.current) || roundTrip <= serverClockBestRttRef.current + 40) {
+            serverClockOffsetRef.current = Number.isFinite(serverClockBestRttRef.current)
+              ? serverClockOffsetRef.current * 0.75 + offsetSample * 0.25
+              : offsetSample;
+            serverClockBestRttRef.current = Math.min(serverClockBestRttRef.current, roundTrip);
+          }
+        }
         collaborationPollFailuresRef.current = 0;
         setCollaborationPhase("connected");
         setCollaboration((current) => current ? {
@@ -1243,11 +1316,11 @@ function App() {
           }
           if (event.kind === "transport") {
             const rawPosition = Number(event.payload.position);
-            const playbackRate = Number(event.payload.playbackRate);
+            const nominalPlaybackRate = Number(event.payload.playbackRate);
             const playing = event.payload.playing === true;
-            const emittedAt = Number(event.payload.emittedAt);
+            const serverEmittedAtMs = Number(event.payload.serverEmittedAtMs);
             const video = videoRef.current;
-            if (!video || !Number.isFinite(rawPosition) || !Number.isFinite(playbackRate)) continue;
+            if (!video || !Number.isFinite(rawPosition) || !Number.isFinite(nominalPlaybackRate)) continue;
             if (activePlaybackOperationRef.current) {
               if (playbackOperationPhaseRef.current === "preparing" || playing) continue;
               if (playbackCommitTimerRef.current) {
@@ -1258,17 +1331,28 @@ function App() {
               playbackOperationPhaseRef.current = null;
               setPlaybackSyncStatus(null);
             }
-            const transitSeconds = playing && Number.isFinite(emittedAt)
-              ? Math.max(0, Math.min(5, (Date.now() - emittedAt) / 1_000))
+            const estimatedServerNow = Date.now() + serverClockOffsetRef.current;
+            const transitSeconds = playing && Number.isFinite(serverEmittedAtMs)
+              ? Math.max(0, Math.min(5, (estimatedServerNow - serverEmittedAtMs) / 1_000))
               : 0;
-            const position = rawPosition + transitSeconds * playbackRate;
+            const position = rawPosition + transitSeconds * nominalPlaybackRate;
             remoteTransportUntilRef.current = Date.now() + 1_200;
-            setPlaybackRate(playbackRate);
-            video.playbackRate = playbackRate;
-            if (Math.abs(video.currentTime - position) > 0.18) {
+            setPlaybackRate(nominalPlaybackRate);
+            const drift = position - video.currentTime;
+            if (Math.abs(drift) > 0.45) {
+              video.playbackRate = nominalPlaybackRate;
               video.currentTime = Math.max(0, Math.min(video.duration || Number.POSITIVE_INFINITY, position));
               currentTimeRef.current = video.currentTime;
               setCurrentTime(video.currentTime);
+            } else if (playing && !video.paused && Math.abs(drift) > 0.04) {
+              const correction = Math.max(0.96, Math.min(1.04, 1 + drift * 0.12));
+              video.playbackRate = nominalPlaybackRate * correction;
+              if (mixAudioRef.current && !mixAudioRef.current.paused) {
+                mixAudioRef.current.playbackRate = video.playbackRate;
+              }
+            } else {
+              video.playbackRate = nominalPlaybackRate;
+              if (mixAudioRef.current) mixAudioRef.current.playbackRate = nominalPlaybackRate;
             }
             if (playing && video.paused) {
               remotePlayEventRef.current = true;
@@ -1300,7 +1384,7 @@ function App() {
 
   useEffect(() => {
     if (collaboration?.mode !== "host" || !isPlaying) return;
-    const timer = window.setInterval(() => publishTransport({ playing: true }), 2_000);
+    const timer = window.setInterval(() => publishTransport({ playing: true }), 1_000);
     return () => window.clearInterval(timer);
   }, [collaboration?.mode, isPlaying, publishTransport]);
 
@@ -1432,9 +1516,9 @@ function App() {
     resumePositionRef.current = 0;
     if (initialRemotePlayingRef.current) {
       initialRemotePlayingRef.current = false;
-      requestSynchronizedPlayback(video.currentTime, video.playbackRate);
+      requestSynchronizedPlayback(video.currentTime, playbackRate);
     }
-  }, [requestSynchronizedPlayback, showNotice, updateRecentPlayback]);
+  }, [playbackRate, requestSynchronizedPlayback, showNotice, updateRecentPlayback]);
 
   const handleTimeUpdate = useCallback((video: HTMLVideoElement) => {
     const time = video.currentTime;
@@ -1453,7 +1537,7 @@ function App() {
     remotePlayEventRef.current = false;
     if (collaboration && !synchronizedStart && !remotelyApplied) {
       video.pause();
-      requestSynchronizedPlayback(video.currentTime, video.playbackRate);
+      requestSynchronizedPlayback(video.currentTime, playbackRate);
       return;
     }
     if (synchronizedStart) {
@@ -1464,7 +1548,7 @@ function App() {
     setIsPlaying(true);
     if (mixerActive) startMixAt(video.currentTime);
     if (!remotelyApplied) publishTransport({ position: video.currentTime, playing: true });
-  }, [collaboration, mixerActive, publishTransport, requestSynchronizedPlayback, startMixAt]);
+  }, [collaboration, mixerActive, playbackRate, publishTransport, requestSynchronizedPlayback, startMixAt]);
 
   const handleVideoPause = useCallback((video: HTMLVideoElement) => {
     const remotelyApplied = remotePauseEventRef.current;
@@ -1485,16 +1569,24 @@ function App() {
     void persistPlaybackPosition(0).catch(() => undefined);
   }, [persistPlaybackPosition, stopMix]);
 
+  const handleVideoWaiting = useCallback((video: HTMLVideoElement) => {
+    if (!collaboration || video.paused || activePlaybackOperationRef.current) return;
+    const now = Date.now();
+    if (now - lastRebufferRequestRef.current < 1_500) return;
+    lastRebufferRequestRef.current = now;
+    requestSynchronizedPlayback(video.currentTime, playbackRate);
+  }, [collaboration, playbackRate, requestSynchronizedPlayback]);
+
   const handleSeeked = useCallback((video: HTMLVideoElement) => {
     currentTimeRef.current = video.currentTime;
     if (collaboration && !video.paused && Date.now() >= remoteTransportUntilRef.current) {
       video.pause();
-      requestSynchronizedPlayback(video.currentTime, video.playbackRate);
+      requestSynchronizedPlayback(video.currentTime, playbackRate);
       return;
     }
     if (mixerActive && !video.paused) startMixAt(video.currentTime);
     publishTransport({ position: video.currentTime, playing: !video.paused });
-  }, [collaboration, mixerActive, publishTransport, requestSynchronizedPlayback, startMixAt]);
+  }, [collaboration, mixerActive, playbackRate, publishTransport, requestSynchronizedPlayback, startMixAt]);
 
   const addBookmark = useCallback(async () => {
     if (!document || !IS_TAURI) {
@@ -2241,6 +2333,7 @@ function App() {
                 key={videoUrl}
                 ref={videoRef}
                 src={videoUrl ?? undefined}
+                preload="auto"
                 onClick={togglePlayback}
                 onLoadedMetadata={(event) => handleLoadedMetadata(event.currentTarget)}
                 onDurationChange={(event) => setDuration(event.currentTarget.duration)}
@@ -2249,6 +2342,8 @@ function App() {
                 onPause={(event) => handleVideoPause(event.currentTarget)}
                 onSeeking={() => mixAudioRef.current?.pause()}
                 onSeeked={(event) => handleSeeked(event.currentTarget)}
+                onWaiting={(event) => handleVideoWaiting(event.currentTarget)}
+                onStalled={(event) => handleVideoWaiting(event.currentTarget)}
                 onEnded={handleVideoEnded}
                 onError={() => showNotice("Playback could not decode this video container or codec.", "error")}
               />

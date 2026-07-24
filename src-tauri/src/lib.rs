@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use tungstenite::Message;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -8,7 +9,10 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command as StdCommand, Stdio},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -74,7 +78,20 @@ struct CollaborationService {
     joined: Arc<Mutex<Option<JoinedSession>>>,
     host_cursor: Arc<Mutex<u64>>,
     client_id: String,
+    /// When hosting via the internet relay, stores the connection state.
+    relay: Arc<RwLock<Option<RelayState>>>,
 }
+
+/// Tracks an active internet-relay session.
+struct RelayState {
+    #[allow(dead_code)]
+    url: String,
+    /// The relay listener thread checks this flag. Set to true to wind down.
+    disconnect: Arc<AtomicBool>,
+}
+
+unsafe impl Send for RelayState {}
+unsafe impl Sync for RelayState {}
 
 #[derive(Clone)]
 struct HostedSession {
@@ -1085,6 +1102,7 @@ fn start_collaboration_service() -> Result<CollaborationService, String> {
         joined: Arc::new(Mutex::new(None)),
         host_cursor: Arc::new(Mutex::new(0)),
         client_id: Uuid::new_v4().to_string(),
+        relay: Arc::new(RwLock::new(None)),
     })
 }
 
@@ -1616,6 +1634,290 @@ fn host_collaboration(
     Ok(hosted_session_info(&state.collaboration, &session))
 }
 
+#[tauri::command]
+async fn host_relay_session(
+    _app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    relay_url: String,
+    video_path: String,
+    display_name: String,
+) -> Result<CollaborationSessionInfo, String> {
+    let relay_url = relay_url.trim().trim_end_matches('/').to_string();
+    if relay_url.is_empty() {
+        return Err("Enter the relay server address.".into());
+    }
+    {
+        let joined = state
+            .collaboration
+            .joined
+            .lock()
+            .map_err(|_| "The collaboration state is unavailable.".to_string())?;
+        if joined.is_some() {
+            return Err("Leave the current shared session before hosting another one.".into());
+        }
+    }
+    {
+        let hosted = state
+            .collaboration
+            .hosted
+            .read()
+            .map_err(|_| "The collaboration state is unavailable.".to_string())?;
+        if hosted.is_some() {
+            return Err("This project is already being shared.".into());
+        }
+    }
+    {
+        let relay_active = state
+            .collaboration
+            .relay
+            .read()
+            .map_err(|_| "The collaboration state is unavailable.".to_string())?;
+        if relay_active.is_some() {
+            return Err("An internet session is already active.".into());
+        }
+    }
+
+    let video = validate_video_path(&video_path)?;
+    let (sidecar, markdown) = read_or_create_markdown(&video)?;
+    let video_name = video
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Shared video")
+        .to_string();
+    let code = six_digit_session_code();
+    let token = Uuid::new_v4().to_string();
+    let host_name_label = sanitize_metadata(&display_name, "Host");
+
+    let session = HostedSession {
+        code: code.clone(),
+        token: token.clone(),
+        service_fullname: String::new(),
+        video_path: video,
+        sidecar_path: sidecar,
+        video_name: video_name.clone(),
+        audio_tracks: probe_audio_tracks(Path::new(&video_path)),
+        frame_rate: probe_frame_rate(Path::new(&video_path)),
+        host_name: host_name_label.clone(),
+        runtime: Arc::new(Mutex::new(HostedSessionRuntime {
+            sequence: 0,
+            document_revision: 0,
+            markdown: markdown.clone(),
+            transport: CollaborationTransport {
+                position: playback_position(&markdown),
+                playing: false,
+                playback_rate: 1.0,
+            },
+            events: VecDeque::new(),
+            peers: HashMap::new(),
+        })),
+    };
+
+    // Connect to relay and register — run on blocking thread
+    let ws_url = format!("wss://{relay_url}/ws");
+    let register_code = code.clone();
+    let register_token = token.clone();
+    let register_host = host_name_label.clone();
+    let register_video = video_name.clone();
+
+    let ws = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+        let (mut ws, _) = tungstenite::connect(&ws_url)
+            .map_err(|e| format!("Could not connect to relay ({ws_url}): {e}"))?;
+
+        let register = serde_json::json!({
+            "type": "register",
+            "code": register_code,
+            "token": register_token,
+            "hostName": register_host,
+            "videoName": register_video,
+        });
+        ws.send(Message::Text(register.to_string().into()))
+            .map_err(|e| format!("Could not register with relay: {e}"))?;
+
+        match ws.read().map_err(|e| format!("Relay error: {e}"))? {
+            Message::Text(text) => {
+                let data: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|_| "Relay sent invalid response.".to_string())?;
+                if data["type"] != "registered" {
+                    let msg = data["message"]
+                        .as_str()
+                        .unwrap_or("relay rejected registration");
+                    return Err(msg.to_string());
+                }
+            }
+            _ => return Err("Relay sent unexpected response.".into()),
+        }
+
+        Ok(ws)
+    })
+    .await
+    .map_err(|e| format!("The relay connection failed: {e}"))??;
+
+    // Store the hosted session
+    *state
+        .collaboration
+        .hosted
+        .write()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())? =
+        Some(session.clone());
+    *state
+        .collaboration
+        .host_cursor
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())? = 0;
+
+    // Spawn relay listener thread
+    let disconnect = Arc::new(AtomicBool::new(false));
+    let disconnect_clone = Arc::clone(&disconnect);
+    let coll = state.collaboration.clone();
+    let relay_url_store = relay_url.clone();
+    let port = state.collaboration.port;
+
+    thread::Builder::new()
+        .name("framenote-relay".into())
+        .spawn(move || {
+            let mut ws = ws; // move ws into the thread
+            loop {
+                if disconnect_clone.load(Ordering::Relaxed) {
+                    let _ = ws.send(Message::Close(None));
+                    break;
+                }
+
+                let msg = match ws.read() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                };
+
+                match msg {
+                    Message::Text(text) => {
+                        let data: serde_json::Value = match serde_json::from_str(&text) {
+                            Ok(d) => d,
+                            Err(_) => continue,
+                        };
+
+                        match data["type"].as_str() {
+                            Some("http-request") => {
+                                let Some(id) = data["id"].as_str().map(|s| s.to_string()) else {
+                                    continue;
+                                };
+                                let method = data["method"].as_str().unwrap_or("GET").to_string();
+                                let path = data["path"].as_str().unwrap_or("/").to_string();
+                                let body_b64 = data["body"].as_str().map(|s| s.to_string());
+
+                                let local_url = format!("http://127.0.0.1:{port}{path}");
+
+                                let client = reqwest::blocking::Client::builder()
+                                    .timeout(Duration::from_secs(30))
+                                    .build()
+                                    .expect("reqwest client");
+
+                                let mut req = client.request(
+                                    method.parse().unwrap_or(reqwest::Method::GET),
+                                    &local_url,
+                                );
+
+                                if let Some(headers) = data["headers"].as_object() {
+                                    for (k, v) in headers {
+                                        if let Some(v) = v.as_str() {
+                                            let lower = k.to_lowercase();
+                                            if lower != "host"
+                                                && lower != "connection"
+                                                && lower != "upgrade"
+                                            {
+                                                req = req.header(k.as_str(), v);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let response = if let Some(b64) = &body_b64 {
+                                    if let Ok(bytes) = BASE64.decode(b64) {
+                                        req.body(bytes).send()
+                                    } else {
+                                        req.send()
+                                    }
+                                } else {
+                                    req.send()
+                                };
+
+                                match response {
+                                    Ok(resp) => {
+                                        let status = resp.status().as_u16() as u64;
+                                        let resp_headers = resp
+                                            .headers()
+                                            .iter()
+                                            .map(|(k, v)| {
+                                                (
+                                                    k.to_string(),
+                                                    serde_json::Value::String(
+                                                        v.to_str().unwrap_or("").to_string(),
+                                                    ),
+                                                )
+                                            })
+                                            .collect::<serde_json::Map<_, _>>();
+                                        let resp_body = resp.bytes().unwrap_or_default();
+                                        let body_b64 = BASE64.encode(&resp_body);
+
+                                        let response_msg = serde_json::json!({
+                                            "type": "http-response",
+                                            "id": id,
+                                            "status": status,
+                                            "headers": resp_headers,
+                                            "body": body_b64,
+                                        });
+                                        if ws
+                                            .send(Message::Text(response_msg.to_string().into()))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let error_msg = serde_json::json!({
+                                            "type": "http-response",
+                                            "id": id,
+                                            "status": 502,
+                                            "headers": {},
+                                            "body": BASE64.encode(format!("Proxy error: {e}")),
+                                        });
+                                        let _ = ws.send(Message::Text(error_msg.to_string().into()));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Message::Ping(data) => {
+                        let _ = ws.send(Message::Pong(data));
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+
+            // Cleanup
+            if let Ok(mut relay_state) = coll.relay.write() {
+                *relay_state = None;
+            }
+            if let Ok(mut hosted) = coll.hosted.write() {
+                *hosted = None;
+            }
+        })
+        .map_err(|e| format!("Could not start the relay listener: {e}"))?;
+
+    // Store relay state
+    *state
+        .collaboration
+        .relay
+        .write()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())? =
+        Some(RelayState {
+            url: relay_url_store,
+            disconnect,
+        });
+
+    Ok(hosted_session_info(&state.collaboration, &session))
+}
+
 fn join_discovered_session(
     service: &CollaborationService,
     code: &str,
@@ -1750,6 +2052,161 @@ async fn join_collaboration(
         code: code.clone(),
         token: network.token.clone(),
         host_base_url,
+        video_name: network.video_name.clone(),
+        shadow_sidecar_path: shadow_sidecar_path.clone(),
+        peer_id: state.collaboration.client_id.clone(),
+        display_name: display_name.clone(),
+        cursor: network.sequence,
+    };
+    *state
+        .collaboration
+        .joined
+        .lock()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())? = Some(joined);
+    let initial_transport = network.transport.clone();
+    let document = SidecarDocument {
+        video_path: shadow_video_path.to_string_lossy().into_owned(),
+        video_name: network.video_name.clone(),
+        sidecar_path: shadow_sidecar_path.to_string_lossy().into_owned(),
+        markdown: network.markdown,
+        playback_position: network.transport.position,
+    };
+    Ok(JoinCollaborationResult {
+        document,
+        media_registration: MediaRegistration {
+            url: format!("{}/media/{media_token}", state.media.base_url),
+            mix_base_url: format!("{}/mix/{media_token}", state.media.base_url),
+            audio_tracks: network.audio_tracks,
+            frame_rate: network.frame_rate,
+        },
+        session: CollaborationSessionInfo {
+            mode: "guest".into(),
+            code,
+            participant_count: 2,
+            video_name: network.video_name,
+            display_name: display_name.clone(),
+            client_id: state.collaboration.client_id.clone(),
+            participants: vec![network.host_name, display_name],
+        },
+        transport: initial_transport,
+    })
+}
+
+#[tauri::command]
+async fn join_relay_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    relay_url: String,
+    code: String,
+    display_name: String,
+) -> Result<JoinCollaborationResult, String> {
+    let code = code.trim().to_string();
+    if code.len() != 6 || !code.chars().all(|character| character.is_ascii_digit()) {
+        return Err("Enter the six-digit session code.".into());
+    }
+    let relay_url = relay_url.trim().trim_end_matches('/').to_string();
+    if relay_url.is_empty() {
+        return Err("Enter the relay server address.".into());
+    }
+    {
+        let hosted = state
+            .collaboration
+            .hosted
+            .read()
+            .map_err(|_| "The collaboration state is unavailable.".to_string())?;
+        if hosted.is_some() {
+            return Err("Stop hosting before joining another session.".into());
+        }
+    }
+    {
+        let joined = state
+            .collaboration
+            .joined
+            .lock()
+            .map_err(|_| "The collaboration state is unavailable.".to_string())?;
+        if joined.is_some() {
+            return Err("Leave the current session before joining another one.".into());
+        }
+    }
+
+    let http_base = format!("https://{relay_url}");
+    let join_url = format!("{http_base}/join");
+    let display_name = sanitize_metadata(&display_name, "Guest");
+    let peer_id = state.collaboration.client_id.clone();
+
+    // Clone values before moving into the blocking closure
+    let join_code = code.clone();
+    let join_peer_id = peer_id.clone();
+    let join_display_name = display_name.clone();
+    let join_http_base = http_base.clone();
+
+    let network: NetworkJoinResponse = tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Could not prepare relay connection: {e}"))?;
+
+        let response = client
+            .post(&join_url)
+            .json(&serde_json::json!({
+                "code": join_code,
+                "peerId": join_peer_id,
+                "displayName": join_display_name,
+            }))
+            .send()
+            .map_err(|e| {
+                format!("Could not reach the relay server ({join_http_base}): {e}")
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(format!("The relay returned {status}: {body}"));
+        }
+
+        response
+            .json::<NetworkJoinResponse>()
+            .map_err(|e| format!("Invalid session data from relay: {e}"))
+    })
+    .await
+    .map_err(|e| format!("The join request failed: {e}"))??;
+
+    // Set up cached files (identical to join_collaboration)
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?
+        .join("collaboration")
+        .join(&network.token[..12]);
+    fs::create_dir_all(&cache_root)
+        .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?;
+    let shadow_video_path = cache_root.join(safe_file_component(&network.video_name, 120));
+    if !shadow_video_path.exists() {
+        fs::write(&shadow_video_path, [])
+            .map_err(|error| format!("Could not prepare the shared project cache: {error}"))?;
+    }
+    let shadow_sidecar_path = shadow_video_path.with_extension("md");
+    fs::write(&shadow_sidecar_path, &network.markdown)
+        .map_err(|error| format!("Could not cache the shared Markdown: {error}"))?;
+    let media_token = Uuid::new_v4().to_string();
+    state
+        .media
+        .files
+        .write()
+        .map_err(|_| "The private media server is unavailable.".to_string())?
+        .insert(
+            media_token.clone(),
+            MediaSource::Remote(RemoteMediaSource {
+                media_url: format!("{http_base}/session/{}/media", network.token),
+                mix_url: format!("{http_base}/session/{}/mix", network.token),
+                content_type: media_content_type(Path::new(&network.video_name)).into(),
+            }),
+        );
+    let joined = JoinedSession {
+        code: code.clone(),
+        token: network.token.clone(),
+        host_base_url: http_base,
         video_name: network.video_name.clone(),
         shadow_sidecar_path: shadow_sidecar_path.clone(),
         peer_id: state.collaboration.client_id.clone(),
@@ -1969,6 +2426,16 @@ fn collaboration_status(
 
 #[tauri::command]
 fn stop_collaboration(state: State<'_, AppState>) -> Result<(), String> {
+    // Disconnect relay if active (signals the relay listener thread to stop)
+    if let Some(relay) = state
+        .collaboration
+        .relay
+        .write()
+        .map_err(|_| "The collaboration state is unavailable.".to_string())?
+        .take()
+    {
+        relay.disconnect.store(true, Ordering::Relaxed);
+    }
     if let Some(session) = state
         .collaboration
         .hosted
@@ -4006,6 +4473,8 @@ pub fn run() {
             publish_collaboration_event,
             collaboration_status,
             stop_collaboration,
+            host_relay_session,
+            join_relay_session,
             prepare_export_directory,
             register_media_source,
             extract_waveform,

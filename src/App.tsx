@@ -13,6 +13,7 @@ import {
   FileText,
   Film,
   FolderOpen,
+  Globe,
   HardDrive,
   KeyRound,
   Maximize2,
@@ -418,6 +419,8 @@ function App() {
   const [collaborationPhase, setCollaborationPhase] = useState<"idle" | "hosting" | "joining" | "connected" | "reconnecting">("idle");
   const [joinCode, setJoinCode] = useState("");
   const [displayName, setDisplayName] = useState(() => localStorage.getItem("framenote:display-name") || "Editor");
+  const [shareMode, setShareMode] = useState<"local" | "internet">("local");
+  const [relayUrl, setRelayUrl] = useState(() => localStorage.getItem("framenote:relay-url") || "framenote.pulsardigital.sk");
 
   const selectedAudioTracks = useMemo(
     () => mediaRegistration?.audioTracks.filter((track) => trackLevels[track.streamIndex] !== undefined) ?? [],
@@ -863,20 +866,30 @@ function App() {
     setCollaborationPhase("hosting");
     localStorage.setItem("framenote:display-name", displayName.trim() || "Host");
     try {
-      const session = await invoke<CollaborationSession>("host_collaboration", {
-        videoPath: document.videoPath,
-        displayName,
-      });
+      let session: CollaborationSession;
+      if (shareMode === "internet") {
+        localStorage.setItem("framenote:relay-url", relayUrl);
+        session = await invoke<CollaborationSession>("host_relay_session", {
+          relayUrl,
+          videoPath: document.videoPath,
+          displayName,
+        });
+      } else {
+        session = await invoke<CollaborationSession>("host_collaboration", {
+          videoPath: document.videoPath,
+          displayName,
+        });
+      }
       lastSharedMarkdownRef.current = document.markdown;
       collaborationPollFailuresRef.current = 0;
       setCollaboration(session);
       setCollaborationPhase("connected");
-      showNotice(`Session ${session.code} is live on this local network.`);
+      showNotice(`Session ${session.code} is live on ${shareMode === "internet" ? "the internet" : "this local network"}.`);
     } catch (error) {
       setCollaborationPhase("idle");
       showNotice(errorMessage(error), "error");
     }
-  }, [displayName, document, showNotice]);
+  }, [displayName, document, relayUrl, shareMode, showNotice]);
 
   const joinSharing = useCallback(async () => {
     if (!IS_TAURI) return;
@@ -889,10 +902,20 @@ function App() {
     localStorage.setItem("framenote:display-name", displayName.trim() || "Guest");
     try {
       await persistPlaybackPosition().catch(() => undefined);
-      const result = await invoke<JoinCollaborationResult>("join_collaboration", {
-        code: normalizedCode,
-        displayName,
-      });
+      let result: JoinCollaborationResult;
+      if (shareMode === "internet") {
+        localStorage.setItem("framenote:relay-url", relayUrl);
+        result = await invoke<JoinCollaborationResult>("join_relay_session", {
+          relayUrl,
+          code: normalizedCode,
+          displayName,
+        });
+      } else {
+        result = await invoke<JoinCollaborationResult>("join_collaboration", {
+          code: normalizedCode,
+          displayName,
+        });
+      }
       stopMix();
       applyDocument(result.document);
       setMediaRegistration(result.mediaRegistration);
@@ -928,7 +951,7 @@ function App() {
       setCollaborationPhase("idle");
       showNotice(errorMessage(error), "error");
     }
-  }, [applyDocument, displayName, joinCode, persistPlaybackPosition, showNotice, stopMix]);
+  }, [applyDocument, displayName, joinCode, persistPlaybackPosition, relayUrl, shareMode, showNotice, stopMix]);
 
   const stopSharing = useCallback(async () => {
     const wasGuest = collaboration?.mode === "guest";
@@ -1824,8 +1847,12 @@ function App() {
             canHost={false}
             code={joinCode}
             displayName={displayName}
+            shareMode={shareMode}
+            relayUrl={relayUrl}
             onCode={setJoinCode}
             onDisplayName={setDisplayName}
+            onShareMode={setShareMode}
+            onRelayUrl={setRelayUrl}
             onHost={() => void startSharing()}
             onJoin={() => void joinSharing()}
             onCopy={() => void copySessionCode()}
@@ -2272,8 +2299,12 @@ function App() {
           canHost={true}
           code={joinCode}
           displayName={displayName}
+          shareMode={shareMode}
+          relayUrl={relayUrl}
           onCode={setJoinCode}
           onDisplayName={setDisplayName}
+          onShareMode={setShareMode}
+          onRelayUrl={setRelayUrl}
           onHost={() => void startSharing()}
           onJoin={() => void joinSharing()}
           onCopy={() => void copySessionCode()}
@@ -2720,8 +2751,12 @@ function CollaborationDialog({
   canHost,
   code,
   displayName,
+  shareMode,
+  relayUrl,
   onCode,
   onDisplayName,
+  onShareMode,
+  onRelayUrl,
   onHost,
   onJoin,
   onCopy,
@@ -2733,8 +2768,12 @@ function CollaborationDialog({
   canHost: boolean;
   code: string;
   displayName: string;
+  shareMode: "local" | "internet";
+  relayUrl: string;
   onCode: (code: string) => void;
   onDisplayName: (name: string) => void;
+  onShareMode: (mode: "local" | "internet") => void;
+  onRelayUrl: (url: string) => void;
   onHost: () => void;
   onJoin: () => void;
   onCopy: () => void;
@@ -2757,7 +2796,7 @@ function CollaborationDialog({
           <div className="session-connected">
             <div className={`session-network-state ${phase}`}>
               {phase === "reconnecting" ? <WifiOff size={17} /> : <Wifi size={17} />}
-              <div><strong>{phase === "reconnecting" ? "Reconnecting on local network" : session.mode === "host" ? "Session is discoverable" : "Connected directly to host"}</strong><span>{session.videoName}</span></div>
+              <div><strong>{phase === "reconnecting" ? "Reconnecting…" : session.mode === "host" ? "Session is active" : "Connected"}</strong><span>{session.videoName}</span></div>
             </div>
             <button className="session-code" onClick={onCopy} aria-label={`Copy session code ${session.code}`}>
               <span>Six-digit code</span>
@@ -2777,9 +2816,19 @@ function CollaborationDialog({
               <span>Your name</span>
               <input value={displayName} maxLength={48} autoComplete="name" onChange={(event) => onDisplayName(event.target.value)} placeholder="Editor" />
             </label>
+            <div className="session-mode-toggle">
+              <button className={shareMode === "local" ? "active" : ""} onClick={() => onShareMode("local")}><Wifi size={14} /> Local network</button>
+              <button className={shareMode === "internet" ? "active" : ""} onClick={() => onShareMode("internet")}><Globe size={14} /> Internet</button>
+            </div>
+            {shareMode === "internet" && (
+              <label className="session-relay-url">
+                <span>Relay server</span>
+                <input value={relayUrl} onChange={(event) => onRelayUrl(event.target.value)} placeholder="framenote.example.com" />
+              </label>
+            )}
             {canHost && (
               <div className="session-path host-path">
-                <div><Share2 size={17} /><span><strong>Create session</strong><small>Share this video and its timeline from this computer.</small></span></div>
+                <div><Share2 size={17} /><span><strong>Create session</strong><small>{shareMode === "internet" ? "Share over the internet via relay." : "Share on the local network."}</small></span></div>
                 <button className="primary compact" disabled={busy} onClick={onHost}>{phase === "hosting" ? <RefreshCw className="spin" size={14} /> : <Wifi size={14} />}{phase === "hosting" ? "Starting…" : "Create"}</button>
               </div>
             )}
@@ -2802,7 +2851,7 @@ function CollaborationDialog({
               </label>
               <button className="secondary" disabled={busy || code.length !== 6} onClick={onJoin}>{phase === "joining" ? <RefreshCw className="spin" size={14} /> : <Users size={14} />}{phase === "joining" ? "Finding…" : "Join"}</button>
             </div>
-            <p className="session-footnote">Both computers must be on the same local network. The code finds the host through peer discovery; no account, cloud upload, or central FrameNote server is used.</p>
+            <p className="session-footnote">{shareMode === "internet" ? "Both computers connect through the relay server. No local network or mDNS needed." : "Both computers must be on the same local network. The code finds the host through peer discovery; no account, cloud upload, or central FrameNote server is used."}</p>
           </div>
         )}
       </section>
